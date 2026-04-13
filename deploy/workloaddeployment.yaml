@@ -1,0 +1,29 @@
+apiVersion: runtime.wasmcloud.dev/v1alpha1
+kind: WorkloadDeployment
+metadata:
+  name: lattice-db
+  annotations:
+    description: lattice-db storage service (local dev)
+spec:
+  replicas: 1
+  deployPolicy: RollingUpdate
+  template:
+    labels:
+      app.kubernetes.io/name: lattice-db
+      app.kubernetes.io/component: storage
+    spec:
+      # No components — lattice-db is a standalone service.
+      components: []
+      service:
+        image: kind-registry:5000/lattice-db/storage-service:dev
+        maxRestarts: 5
+        localResources:
+          environment:
+            config:
+              NATS_URL: "__NATS_URL__"
+      hostInterfaces:
+        # The service needs outgoing TCP to connect to NATS.
+        - namespace: wasi
+          package: sockets
+          interfaces:
+            - tcp

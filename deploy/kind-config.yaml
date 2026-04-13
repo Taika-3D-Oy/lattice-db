@@ -1,0 +1,21 @@
+# Kind cluster config for local lattice-db development.
+# Exposes NATS (4222) and the wasmCloud gateway (30950→8000) to the host.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+    extraPortMappings:
+      # wasmCloud HTTP gateway
+      - containerPort: 30950
+        hostPort: 8000
+        protocol: TCP
+      # NATS client port (for testing from host)
+      - containerPort: 30422
+        hostPort: 4222
+        protocol: TCP
+kubeadmConfigPatches:
+  - |
+    kind: ClusterConfiguration
+    apiServer:
+      extraArgs:
+        service-node-port-range: "4222-32767"

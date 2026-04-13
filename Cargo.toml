@@ -1,0 +1,27 @@
+[workspace]
+members = [
+    "storage-service",
+]
+exclude = [
+    "lattice-db-client",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+authors = ["Taika 3D Oy"]
+repository = "https://github.com/Taika-3D-Oy/lattice-db"
+description = "NATS-native distributed database for wasmCloud"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+wit-bindgen = { version = "0.54", default-features = false, features = ["async", "async-spawn", "macros"] }
+wasip3 = "0.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+lto = true
+opt-level = "s"
+strip = true
