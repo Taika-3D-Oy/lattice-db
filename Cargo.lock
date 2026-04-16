@@ -166,6 +166,31 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
+name = "lattice-db-client"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "nats-wasip3",
+ "serde",
+ "serde_json",
+ "wasip3",
+ "wit-bindgen",
+]
+
+[[package]]
+name = "lattice-sql"
+version = "0.1.0"
+dependencies = [
+ "lattice-db-client",
+ "nats-wasip3",
+ "serde",
+ "serde_json",
+ "sqlparser",
+ "wasip3",
+ "wit-bindgen",
+]
+
+[[package]]
 name = "leb128fmt"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -285,6 +310,15 @@ name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
+
+[[package]]
+name = "sqlparser"
+version = "0.55.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c4521174166bac1ff04fe16ef4524c70144cd29682a45978978ca3d7f4e0be11"
+dependencies = [
+ "log",
+]
 
 [[package]]
 name = "storage-service"

@@ -198,6 +198,19 @@ bash deploy/deploy-local.sh teardown
 
 Prerequisites: `kind`, `kubectl`, `helm`, `docker`, `cargo`, `wash`
 
+### Public Registry Deployment
+
+If you want to include `lattice-db` directly in another wasmCloud setup, publish
+`storage_service.wasm` to an OCI registry and use
+`deploy/workloaddeployment-public.yaml` as the drop-in manifest.
+
+```bash
+kubectl apply -f deploy/workloaddeployment-public.yaml
+```
+
+Important: `lattice-db` is built for `wasm32-wasip3`. The target wasmCloud host
+must have wasip3 enabled (for example, `wash host --wasip3`).
+
 ## Test
 
 94 integration tests covering all operations:
@@ -209,6 +222,8 @@ bash tests/integration.sh
 # Against the Kind cluster with mTLS
 bash tests/integration.sh --tls
 ```
+
+For instructions on configuring a Kubernetes testing cluster to support the latest `wasm32-wasip3` dependencies natively, please see the [Testing on Kubernetes Setup Guide](TESTING.md).
 
 Requires: `nats` CLI, `jq`, `base64`
 
@@ -228,7 +243,8 @@ lattice-db/
 │   └── src/
 │       └── lib.rs          # LatticeDb struct with all typed methods
 ├── deploy/
-│   └── deploy-local.sh     # Kind cluster setup and deployment
+│   ├── deploy-local.sh               # Kind cluster setup and deployment
+│   └── workloaddeployment-public.yaml # public OCI deployment example
 └── tests/
     └── integration.sh      # 94 integration tests
 ```

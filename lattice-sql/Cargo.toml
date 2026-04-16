@@ -1,0 +1,21 @@
+[package]
+name = "lattice-sql"
+version = "0.1.0"
+edition = "2021"
+description = "SQL frontend for lattice-db — parses SQL, plans queries, executes against storage-service over NATS"
+license = "Apache-2.0"
+autobins = false
+
+[lib]
+name = "lattice_sql"
+path = "src/main.rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+lattice-db-client = { path = "../lattice-db-client" }
+nats-wasi = { package = "nats-wasip3", version = "0.3" }
+wasip3 = "0.5"
+wit-bindgen = { version = "0.54", default-features = false, features = ["async", "async-spawn", "macros"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlparser = { version = "0.55", default-features = false }

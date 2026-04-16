@@ -1,0 +1,24 @@
+[package]
+name = "lattice-sql-client"
+version = "0.1.0"
+edition = "2021"
+description = "Typed Rust client SDK for lattice-sql — SQL frontend for lattice-db"
+license = "Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/Taika-3D-Oy/lattice-db"
+keywords = ["lattice-db", "lattice-sql", "sql", "nats", "wasi"]
+categories = ["database", "wasm"]
+authors = ["Taika 3D Oy"]
+rust-version = "1.85"
+autobins = false
+
+[dependencies]
+nats-wasi = { package = "nats-wasip3", version = "0.3" }
+wasip3 = "0.5"
+wit-bindgen = { version = "0.54", default-features = false, features = ["async", "async-spawn", "macros"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[[example]]
+name = "smoke_test"
+crate-type = ["cdylib"]

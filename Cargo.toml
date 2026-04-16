@@ -1,15 +1,17 @@
 [workspace]
 members = [
     "storage-service",
+    "lattice-sql",
 ]
 exclude = [
     "lattice-db-client",
+    "lattice-sql-client",
 ]
 resolver = "3"
 
 [workspace.package]
 edition = "2021"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Taika 3D Oy"]
 repository = "https://github.com/Taika-3D-Oy/lattice-db"
 description = "NATS-native distributed database for wasmCloud"

@@ -1,0 +1,33 @@
+apiVersion: runtime.wasmcloud.dev/v1alpha1
+kind: WorkloadDeployment
+metadata:
+  name: lattice-db
+  annotations:
+    description: lattice-db storage service (public registry example)
+spec:
+  replicas: 1
+  deployPolicy: RollingUpdate
+  template:
+    labels:
+      app.kubernetes.io/name: lattice-db
+      app.kubernetes.io/component: storage
+    spec:
+      # NOTE: This service is built for wasm32-wasip3.
+      # Your wasmCloud host must run with wasip3 enabled (for example: wash host --wasip3).
+      components: []
+      service:
+        # Replace with your published OCI reference/tag.
+        image: ghcr.io/taika-3d-oy/lattice-db/storage-service:v0.2.0
+        maxRestarts: 5
+        localResources:
+          environment:
+            config:
+              # Use your cluster-reachable NATS endpoint.
+              # If DNS is unavailable in your runtime/network stack, use a direct service IP.
+              NATS_URL: "nats:4222"
+      hostInterfaces:
+        # Required so the service can open outgoing TCP connections to NATS.
+        - namespace: wasi
+          package: sockets
+          interfaces:
+            - tcp
