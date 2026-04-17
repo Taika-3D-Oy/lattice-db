@@ -17,7 +17,7 @@ spec:
       components: []
       service:
         # Replace with your published OCI reference/tag.
-        image: ghcr.io/taika-3d-oy/lattice-db/storage-service:v0.2.0
+        image: ghcr.io/taika-3d-oy/lattice-db/storage-service:v0.3.0
         maxRestarts: 5
         localResources:
           environment:

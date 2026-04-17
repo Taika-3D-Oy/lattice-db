@@ -213,7 +213,7 @@ must have wasip3 enabled (for example, `wash host --wasip3`).
 
 ## Test
 
-94 integration tests covering all operations:
+190 integration tests covering all operations:
 
 ```bash
 # Against a plain local NATS server
@@ -221,6 +221,14 @@ bash tests/integration.sh
 
 # Against the Kind cluster with mTLS
 bash tests/integration.sh --tls
+```
+
+### Multi-Tenancy Tests
+
+96 tests verifying tenant isolation across all operations. Requires the service to be running with `LDB_MULTI_TENANT=1`:
+
+```bash
+bash tests/integration_multitenant.sh
 ```
 
 For instructions on configuring a Kubernetes testing cluster to support the latest `wasm32-wasip3` dependencies natively, please see the [Testing on Kubernetes Setup Guide](TESTING.md).
@@ -246,7 +254,8 @@ lattice-db/
 │   ├── deploy-local.sh               # Kind cluster setup and deployment
 │   └── workloaddeployment-public.yaml # public OCI deployment example
 └── tests/
-    └── integration.sh      # 94 integration tests
+    ├── integration.sh      # 94 integration tests
+    └── integration_multitenant.sh  # 96 multi-tenancy isolation tests
 ```
 
 ## License

@@ -1026,5 +1026,13 @@ fn apply_tenant_prefix(payload: &[u8]) -> Result<Vec<u8>, String> {
     if let Some(table) = v.get("table").and_then(|t| t.as_str()).map(|t| t.to_string()) {
         v["table"] = serde_json::Value::String(format!("{tenant}_{table}"));
     }
+    // Also prefix table names inside transaction ops (ldb.txn).
+    if let Some(ops) = v.get_mut("ops").and_then(|o| o.as_array_mut()) {
+        for op in ops.iter_mut() {
+            if let Some(table) = op.get("table").and_then(|t| t.as_str()).map(|t| t.to_string()) {
+                op["table"] = serde_json::Value::String(format!("{tenant}_{table}"));
+            }
+        }
+    }
     serde_json::to_vec(&v).map_err(|e| format!("serialize: {e}"))
 }
