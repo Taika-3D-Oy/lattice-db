@@ -1,0 +1,62 @@
+name: Build & Push to GHCR
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+
+env:
+  OCI_IMAGE: ghcr.io/taika-3d-oy/lattice-db/storage-service
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust nightly with wasm32-wasip3
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      - name: Install wasm32-wasip2 target (source libc/CRT)
+        run: rustup target add wasm32-wasip2
+
+      - name: Bootstrap wasm32-wasip3 sysroot (libc/CRT)
+        run: |
+          WASIP2_SC="$(rustc --print sysroot)/lib/rustlib/wasm32-wasip2/lib/self-contained"
+          WASIP3_SC="$(rustc --print sysroot)/lib/rustlib/wasm32-wasip3/lib/self-contained"
+          mkdir -p "$WASIP3_SC"
+          cp "$WASIP2_SC"/* "$WASIP3_SC"/
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: "false"
+
+      - name: Install ORAS CLI
+        uses: oras-project/setup-oras@v1
+
+      - name: Build storage-service
+        run: cargo build --release -p storage-service
+
+      - name: Determine tag
+        id: tag
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "version=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=latest" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Push to GHCR
+        run: |
+          oras push \
+            "$OCI_IMAGE:${{ steps.tag.outputs.version }}" \
+            target/wasm32-wasip3/release/storage_service.wasm:application/wasm
