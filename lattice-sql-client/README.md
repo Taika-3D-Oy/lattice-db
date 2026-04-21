@@ -17,7 +17,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-lattice-sql-client = "0.1"
+lattice-sql-client = "1.0"
 nats-wasip3 = "0.7"
 ```
 
@@ -26,7 +26,9 @@ use nats_wasip3::client::{Client, ConnectConfig};
 use lattice_sql_client::LatticeSql;
 
 let client = Client::connect(ConnectConfig::default()).await?;
-let db = LatticeSql::new(client);
+// Optional: auth token (required when server sets LDB_AUTH_TOKEN)
+let db = LatticeSql::new(client)
+    .with_auth("my-secret-token");
 
 // DDL — define a table
 db.ddl("CREATE TABLE users (id TEXT PRIMARY KEY, name TEXT NOT NULL, age INTEGER)").await?;
@@ -95,6 +97,7 @@ db.ddl("DROP TABLE users").await?;
 impl LatticeSql {
     fn new(client: Client) -> Self
     fn with_timeout(client: Client, timeout: Duration) -> Self
+    fn with_auth(self, token: impl Into<String>) -> Self
 
     // Typed shortcuts
     async fn query(&self, sql: &str) -> Result<QueryResult, Error>

@@ -16,7 +16,9 @@
 //!
 //! # async fn example() -> Result<(), lattice_db_client::Error> {
 //! let client = Client::connect(ConnectConfig::default()).await?;
-//! let db = LatticeDb::new(client);
+//! let db = LatticeDb::new(client)
+//!     .with_auth("my-token")          // matches LDB_AUTH_TOKEN on the server
+//!     .with_partition("acme");         // matches LDB_PARTITIONED=1 on the server
 //!
 //! // Store and retrieve JSON
 //! db.put_json("users", "alice", &serde_json::json!({"name": "Alice", "age": 30})).await?;
@@ -390,17 +392,39 @@ struct SchemaSetReqW<'a> { table: &'a str, schema: &'a serde_json::Value }
 pub struct LatticeDb {
     client: Client,
     timeout: Duration,
+    /// Value sent as `_auth` on every request. Must match `LDB_AUTH_TOKEN`.
+    auth_token: Option<String>,
+    /// Value sent as `_partition` on every request. Requires `LDB_PARTITIONED=1`.
+    partition: Option<String>,
 }
 
 impl LatticeDb {
     /// Create a new client with the default 5-second timeout.
     pub fn new(client: Client) -> Self {
-        Self { client, timeout: secs(5) }
+        Self { client, timeout: secs(5), auth_token: None, partition: None }
     }
 
     /// Create a new client with a custom timeout (nanoseconds).
     pub fn with_timeout(client: Client, timeout: Duration) -> Self {
-        Self { client, timeout }
+        Self { client, timeout, auth_token: None, partition: None }
+    }
+
+    /// Attach a shared auth token. Sent as `_auth` in every request.
+    ///
+    /// Required when the server is configured with `LDB_AUTH_TOKEN`.
+    pub fn with_auth(mut self, token: impl Into<String>) -> Self {
+        self.auth_token = Some(token.into());
+        self
+    }
+
+    /// Attach a partition ID. Sent as `_partition` in every request.
+    ///
+    /// Required when the server is configured with `LDB_PARTITIONED=1`.
+    /// Partitions are a logical key-namespace convenience, **not** a security
+    /// boundary — any caller with the shared auth token can read any partition.
+    pub fn with_partition(mut self, id: impl Into<String>) -> Self {
+        self.partition = Some(id.into());
+        self
     }
 
     // ── Core CRUD ──────────────────────────────────────────────
@@ -457,6 +481,14 @@ impl LatticeDb {
         Ok(resp.revision)
     }
 
+    /// Create a key with an expiry (fails if it already exists). Returns the revision.
+    pub async fn create_with_ttl(&self, table: &str, key: &str, value: &[u8], ttl_seconds: u64) -> Result<u64, Error> {
+        let resp: RevisionR = self.req("ldb.create", &PutReq {
+            table, key, value: B64.encode(value), ttl_seconds: Some(ttl_seconds),
+        }).await?;
+        Ok(resp.revision)
+    }
+
     /// Create a key with a JSON value.
     pub async fn create_json<T: Serialize>(&self, table: &str, key: &str, value: &T) -> Result<u64, Error> {
         let bytes = serde_json::to_vec(value).map_err(|e| Error::Json(e.to_string()))?;
@@ -467,6 +499,15 @@ impl LatticeDb {
     pub async fn cas(&self, table: &str, key: &str, value: &[u8], revision: u64) -> Result<u64, Error> {
         let resp: RevisionR = self.req("ldb.cas", &CasReq {
             table, key, value: B64.encode(value), revision, ttl_seconds: None,
+        }).await?;
+        Ok(resp.revision)
+    }
+
+    /// Compare-and-swap with an expiry. Only updates if revision matches;  
+    /// the new value expires after `ttl_seconds`.
+    pub async fn cas_with_ttl(&self, table: &str, key: &str, value: &[u8], revision: u64, ttl_seconds: u64) -> Result<u64, Error> {
+        let resp: RevisionR = self.req("ldb.cas", &CasReq {
+            table, key, value: B64.encode(value), revision, ttl_seconds: Some(ttl_seconds),
         }).await?;
         Ok(resp.revision)
     }
@@ -629,8 +670,20 @@ impl LatticeDb {
     // ── Internal ───────────────────────────────────────────────
 
     /// Send a request and deserialize the response, checking for error.
+    ///
+    /// Injects `_auth` and `_partition` into every request when configured.
     async fn req<Q: Serialize, R: DeserializeOwned>(&self, subject: &str, payload: &Q) -> Result<R, Error> {
-        let body = serde_json::to_vec(payload).map_err(|e| Error::Json(e.to_string()))?;
+        // Serialize to Value so we can inject auth / partition fields.
+        let mut value = serde_json::to_value(payload).map_err(|e| Error::Json(e.to_string()))?;
+        if let Some(obj) = value.as_object_mut() {
+            if let Some(ref token) = self.auth_token {
+                obj.insert("_auth".to_string(), serde_json::Value::String(token.clone()));
+            }
+            if let Some(ref part) = self.partition {
+                obj.insert("_partition".to_string(), serde_json::Value::String(part.clone()));
+            }
+        }
+        let body = serde_json::to_vec(&value).map_err(|e| Error::Json(e.to_string()))?;
         let reply = self.client.request(subject, &body, self.timeout).await?;
         // Check for error response first.
         if let Ok(err) = serde_json::from_slice::<ErrorR>(&reply.payload) {

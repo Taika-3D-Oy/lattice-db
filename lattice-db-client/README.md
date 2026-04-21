@@ -17,7 +17,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-lattice-db-client = "0.1"
+lattice-db-client = "1.0"
 nats-wasip3 = "0.7"
 ```
 
@@ -26,7 +26,11 @@ use nats_wasip3::client::{Client, ConnectConfig};
 use lattice_db_client::LatticeDb;
 
 let client = Client::connect(ConnectConfig::default()).await?;
-let db = LatticeDb::new(client);
+// Optional: auth token (required when server sets LDB_AUTH_TOKEN)
+//           partition (required when server sets LDB_PARTITIONED=1)
+let db = LatticeDb::new(client)
+    .with_auth("my-secret-token")
+    .with_partition("acme");
 
 // Store and retrieve JSON
 db.put_json("users", "alice", &serde_json::json!({"name": "Alice"})).await?;
@@ -53,12 +57,15 @@ db.transaction(vec![
 | Method | Description |
 |--------|-------------|
 | `put` / `put_json` | Store a key-value pair |
+| `put_with_ttl` | Store with an expiry (seconds) |
 | `get` / `get_json` | Retrieve a value by key |
 | `delete` | Remove a key |
 | `exists` | Check if a key exists |
 | `keys` | List all keys in a table |
-| `create` | Insert only if key doesn't exist |
+| `create` / `create_json` | Insert only if key doesn't exist |
+| `create_with_ttl` | Insert with an expiry (fails if key exists) |
 | `cas` | Compare-and-swap (optimistic concurrency) |
+| `cas_with_ttl` | Compare-and-swap with an expiry |
 | `scan` | Query with filters, sorting, pagination |
 | `count` | Count rows matching optional filters |
 | `aggregate` | Sum, avg, min, max, group_by |
@@ -66,6 +73,23 @@ db.transaction(vec![
 | `transaction` | Atomic multi-operation transactions |
 | `set_schema` / `get_schema` / `delete_schema` | JSON schema validation |
 | `create_index` / `list_indexes` / `drop_index` | Secondary indexes |
+
+## Authentication & partitioning
+
+```rust
+// Authenticate against a server with LDB_AUTH_TOKEN set:
+let db = LatticeDb::new(client).with_auth("my-secret-token");
+
+// Use a partition namespace on a server with LDB_PARTITIONED=1:
+let db = LatticeDb::new(client).with_partition("acme");
+
+// Both together:
+let db = LatticeDb::new(client)
+    .with_auth("my-secret-token")
+    .with_partition("acme");
+```
+
+Partitions are a logical key-namespace convenience, **not** a security boundary — any caller with the shared auth token can access any partition.
 
 ## Building
 

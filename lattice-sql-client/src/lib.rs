@@ -14,7 +14,8 @@
 //!
 //! # async fn example() -> Result<(), lattice_sql_client::Error> {
 //! let client = Client::connect(ConnectConfig::default()).await?;
-//! let db = LatticeSql::new(client);
+//! let db = LatticeSql::new(client)
+//!     .with_auth("my-token"); // matches LDB_AUTH_TOKEN on the server
 //!
 //! // DDL — create a table
 //! db.ddl("CREATE TABLE users (id TEXT PRIMARY KEY, name TEXT NOT NULL, age INTEGER)").await?;
@@ -204,6 +205,8 @@ impl SqlResult {
 #[derive(Serialize)]
 struct SqlReq<'a> {
     sql: &'a str,
+    #[serde(rename = "_auth", skip_serializing_if = "Option::is_none")]
+    auth: Option<&'a str>,
 }
 
 /// Unified incoming response.
@@ -252,6 +255,8 @@ struct AnyResp {
 pub struct LatticeSql {
     client: Client,
     timeout: Duration,
+    /// Value sent as `_auth` on every request. Must match `LDB_AUTH_TOKEN`.
+    auth_token: Option<String>,
 }
 
 impl LatticeSql {
@@ -266,12 +271,20 @@ impl LatticeSql {
     /// The timeout is higher than `LatticeDb`'s default (5s) because a single
     /// SQL query may require several round-trips to the storage service.
     pub fn new(client: Client) -> Self {
-        Self { client, timeout: secs(10) }
+        Self { client, timeout: secs(10), auth_token: None }
     }
 
     /// Create a new client with a custom timeout (nanoseconds).
     pub fn with_timeout(client: Client, timeout: Duration) -> Self {
-        Self { client, timeout }
+        Self { client, timeout, auth_token: None }
+    }
+
+    /// Attach a shared auth token. Sent as `_auth` in every request.
+    ///
+    /// Required when the server is configured with `LDB_AUTH_TOKEN`.
+    pub fn with_auth(mut self, token: impl Into<String>) -> Self {
+        self.auth_token = Some(token.into());
+        self
     }
 
     // ── Typed shortcuts ────────────────────────────────────────
@@ -332,7 +345,8 @@ impl LatticeSql {
 
     async fn send<R: DeserializeOwned>(&self, sql: &str) -> Result<R, Error> {
         let body =
-            serde_json::to_vec(&SqlReq { sql }).map_err(|e| Error::Json(e.to_string()))?;
+            serde_json::to_vec(&SqlReq { sql, auth: self.auth_token.as_deref() })
+                .map_err(|e| Error::Json(e.to_string()))?;
         let reply = self
             .client
             .request(Self::SUBJECT, &body, self.timeout)
