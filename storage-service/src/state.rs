@@ -364,11 +364,58 @@ pub fn matches_filters(value: &[u8], filters: &[FieldFilter]) -> bool {
     true
 }
 
-/// Collect matching keys using an index if one covers the first filter.
+/// Collect matching keys using an index if one covers the first filters.
+/// Tries compound indexes first (if multiple filters), then single-field indexes.
 pub fn index_scan(
     table: &TableState,
     filters: &[FieldFilter],
 ) -> Option<Vec<String>> {
+    if filters.is_empty() {
+        return None;
+    }
+
+    // Try compound indexes if we have multiple filters.
+    if filters.len() > 1 {
+        for (idx_name, compound_idx) in &table.compound_indexes {
+            // Check if this compound index covers the first N filters.
+            let field_count = compound_idx.fields.len();
+            if field_count <= filters.len()
+                && filters[..field_count]
+                    .iter()
+                    .enumerate()
+                    .all(|(i, f)| f.field == compound_idx.fields[i])
+                    && filters[..field_count].iter().all(|f| matches!(f.cmp, Comparison::Eq(_)))
+            {
+                // All filters up to field_count are Eq comparisons on the right fields.
+                // Build the composite key and look it up.
+                let mut parts = Vec::new();
+                for (i, f) in filters[..field_count].iter().enumerate() {
+                    if let Comparison::Eq(v) = &f.cmp {
+                        parts.push(v.clone());
+                    } else {
+                        return None; // Should not happen given the check above
+                    }
+                }
+                let composite_key = parts.join("\x1f");
+                let mut keys = compound_idx.data.get(&composite_key).cloned().unwrap_or_default();
+
+                // Filter the remaining filters post-index (if any).
+                if field_count < filters.len() {
+                    let remaining = &filters[field_count..];
+                    keys.retain(|k| {
+                        table
+                            .data
+                            .get(k)
+                            .map_or(false, |row| matches_filters(&row.value, remaining))
+                    });
+                }
+
+                return Some(keys);
+            }
+        }
+    }
+
+    // Fall back to single-field indexes.
     let first = filters.first()?;
     let idx = table.indexes.get(&first.field)?;
 

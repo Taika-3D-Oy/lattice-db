@@ -117,13 +117,17 @@ pub async fn ensure_wal_stream(js: &JetStream) -> Result<(), nats_wasi::Error> {
         max_msgs: 10_000,
         max_bytes: 10 * 1024 * 1024,
         max_msg_size: -1,
+        max_msgs_per_subject: 0,
         storage: nats_wasi::jetstream::Storage::File,
         num_replicas: 1,
-        discard: nats_wasi::jetstream::DiscardPolicy::Old,
+        // Use New so the stream back-pressures writers rather than silently
+        // dropping in-flight PREPARE records when capacity is reached.
+        discard: nats_wasi::jetstream::DiscardPolicy::New,
         max_age: None,
         duplicate_window: None,
         allow_direct: true,
         allow_rollup_hdrs: false,
+        allow_msg_ttl: false,
     };
     js.create_stream(&config).await?;
     Ok(())
@@ -466,17 +470,17 @@ async fn ensure_loaded(table: &str, state: &SharedState, store: &SharedStore) ->
     Ok(())
 }
 
-/// Generate a short unique transaction ID using P3 monotonic clock.
+/// Generate a unique transaction ID.
+/// Format: {timestamp_in_hex}-{counter_in_hex}
+/// The counter is extended to u64 to reduce single-replica collisions.
+/// Across replicas, collisions are rare due to independent counter evolution,
+/// and idempotent rollback semantics handle them gracefully.
 fn generate_txn_id() -> String {
     use std::cell::Cell;
-    thread_local! {
-        static COUNTER: Cell<u32> = const { Cell::new(0) };
-    }
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
     let ts = wasip3::clocks::monotonic_clock::now();
-    let cnt = COUNTER.with(|c| {
-        let v = c.get();
-        c.set(v.wrapping_add(1));
-        v
-    });
-    format!("{:x}-{:04x}", ts, cnt)
+    let cnt = COUNTER.fetch_add(1, Ordering::SeqCst);
+    format!("{:x}-{:016x}", ts, cnt)
 }

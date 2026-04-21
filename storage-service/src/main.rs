@@ -4,8 +4,10 @@
 //! requests to the handler. All state lives in-memory (backed by NATS KV).
 
 mod handler;
+mod log;
 mod state;
 mod store;
+mod tests;
 mod txn;
 
 use nats_wasi::client::{Client, ConnectConfig, secs};
@@ -42,7 +44,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let use_tls = std::env::var("NATS_TLS").map_or(false, |v| v == "1" || v == "true");
 
     if use_tls {
-        eprintln!("lattice-db: TLS enabled (host-side wasi:tls)");
+        log_info!("TLS enabled (host-side wasi:tls)");
     }
 
     eprintln!("lattice-db: connecting to NATS at {nats_addr}");
@@ -65,18 +67,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let shared_store = store::new_shared_store(client.clone());
     let js = JetStream::new(client.clone());
 
-    // Auth / multi-tenancy config.
+    // Auth / partitioning config.
     let auth_token = std::env::var("LDB_AUTH_TOKEN").ok();
-    let multi_tenant = std::env::var("LDB_MULTI_TENANT").map_or(false, |v| v == "1" || v == "true");
+    let partitioned = std::env::var("LDB_PARTITIONED").map_or(false, |v| v == "1" || v == "true");
     if auth_token.is_some() {
         eprintln!("lattice-db: auth token required (_auth field)");
     }
-    if multi_tenant {
-        eprintln!("lattice-db: multi-tenant mode enabled (_tenant field required)");
+    if partitioned {
+        eprintln!("lattice-db: partitioned mode enabled (_partition field required; logical namespace only, not a security boundary)");
     }
     let config: handler::SharedConfig = Rc::new(handler::Config {
         auth_token,
-        multi_tenant,
+        partitioned,
     });
 
     // Set up WAL stream and recover incomplete transactions.

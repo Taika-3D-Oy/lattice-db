@@ -388,6 +388,57 @@ assert_contains "malformed JSON returns error" "invalid request" "$R"
 
 echo ""
 
+# ── 17b. SECURITY GUARDS (S-01 reserved tables, S-04 size caps) ──
+
+echo "--- SECURITY GUARDS ---"
+
+# S-01: reserved (_-prefixed) table names must be rejected on the data plane.
+R=$(req ldb.put "{\"table\":\"_indexes\",\"key\":\"x\",\"value\":\"$(b64 '{}')\"}")
+assert_contains "S-01: put to _indexes rejected" "reserved" "$R"
+
+R=$(req ldb.put "{\"table\":\"_schemas\",\"key\":\"users\",\"value\":\"$(b64 '{}')\"}")
+assert_contains "S-01: put to _schemas rejected" "reserved" "$R"
+
+R=$(req ldb.get "{\"table\":\"_indexes\",\"key\":\"any\"}")
+assert_contains "S-01: get from _indexes rejected" "reserved" "$R"
+
+R=$(req ldb.delete "{\"table\":\"_schemas\",\"key\":\"users\"}")
+assert_contains "S-01: delete from _schemas rejected" "reserved" "$R"
+
+R=$(req ldb.txn "{\"ops\":[{\"op\":\"put\",\"table\":\"_indexes\",\"key\":\"x\",\"value\":\"$(b64 '{}')\"}]}")
+assert_contains "S-01: txn op targeting _indexes rejected" "reserved" "$R"
+
+# Sanity: a _-containing-but-not-prefixed table must still work.
+R=$(req ldb.put "{\"table\":\"my_table\",\"key\":\"k\",\"value\":\"$(b64 '{"v":1}')\"}")
+assert_contains "S-01: my_table (no leading _) accepted" "revision" "$R"
+
+# S-04: oversized value rejected before reaching NATS KV.
+# 1 MiB + 1 byte raw → 1.33 MiB base64. NATS default max msg = 1 MiB,
+# so we test just over the limit by constructing exactly MAX+1 bytes.
+BIG_RAW=$(head -c $((1024 * 1024 + 1)) /dev/zero | tr '\0' 'A')
+BIG_B64=$(echo -n "$BIG_RAW" | base64 | tr -d '\n')
+R=$(req ldb.put "{\"table\":\"$TABLE\",\"key\":\"toobig\",\"value\":\"$BIG_B64\"}" 2>&1 || true)
+# May get rejected by NATS itself (msg too large) or by us (value exceeds).
+# Either rejection is acceptable; the important thing is the row is NOT stored.
+R2=$(req ldb.exists "{\"table\":\"$TABLE\",\"key\":\"toobig\"}")
+assert_json "S-04: oversized value not stored" ".exists" "false" "$R2"
+
+# S-04: oversized key rejected (257 bytes; cap is 256).
+LONG_KEY=$(printf 'k%.0s' {1..257})
+R=$(req ldb.put "{\"table\":\"$TABLE\",\"key\":\"$LONG_KEY\",\"value\":\"$(b64 '{}')\"}")
+assert_contains "S-04: oversized key rejected" "key exceeds" "$R"
+
+# S-04: batch size cap (257 entries; cap is 256).
+ENTRIES=""
+for i in $(seq 1 257); do
+  ENTRIES+="{\"key\":\"bk$i\",\"value\":\"$(b64 '{}')\"},"
+done
+ENTRIES="${ENTRIES%,}"
+R=$(req ldb.batch.put "{\"table\":\"$TABLE\",\"entries\":[$ENTRIES]}")
+assert_contains "S-04: oversized batch rejected" "batch exceeds" "$R"
+
+echo ""
+
 # ── 18. SEPARATE TABLE ISOLATION ─────────────────────────────
 
 echo "--- TABLE ISOLATION ---"

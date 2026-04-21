@@ -141,19 +141,33 @@ nats sub "ldb-events.>"            # all changes across all tables
 
 ## Auth & Multi-Tenancy
 
-Both are opt-in via environment variables.
+Both are opt-in via environment variables. **Important:** This implementation provides organization/partitioning only, not cryptographic isolation.
 
-**Auth token** — set `LDB_AUTH_TOKEN` and every request must include `"_auth": "<token>"`:
+**Auth token** — set `LDB_AUTH_TOKEN` and every request must include `"_auth": "<token>"` in the JSON body:
 
 ```bash
 LDB_AUTH_TOKEN=my-secret
 ```
 
-**Multi-tenancy** — set `LDB_MULTI_TENANT=1` and every request must include `"_tenant": "<id>"`. The tenant ID is transparently prefixed to table names for isolation:
+⚠️ **Security notes:**
+- The token is a single shared secret across all clients.
+- Tokens are sent in plaintext in the JSON message body (not in NATS headers).
+- No per-client identity, rotation, or replay protection.
+- Suitable only for internal networks with trusted clients.
+- For production untrusted networks, use NATS NKey/JWT authentication instead.
+
+**Partitioned mode** — set `LDB_PARTITIONED=1` and every request must include `"_partition": "<id>"`. The partition ID is transparently prefixed to table names:
 
 ```bash
-LDB_MULTI_TENANT=1
+LDB_PARTITIONED=1
 ```
+
+⚠️ **Partition model:**
+- Partitions are a **logical key-namespace convenience**, not a security boundary.
+- Any client with the shared auth token can access any partition by changing the `_partition` field.
+- For cryptographic isolation, use NATS account/permission-based separation, or run a separate lattice-db instance per security domain.
+- Suitable for: operator-owned services where all clients are internal/trusted and partitioning is just a key namespace.
+- Not suitable for: customer-facing SaaS without additional auth/RBAC layers.
 
 ## Build
 
@@ -223,12 +237,12 @@ bash tests/integration.sh
 bash tests/integration.sh --tls
 ```
 
-### Multi-Tenancy Tests
+### Partition Tests
 
-96 tests verifying tenant isolation across all operations. Requires the service to be running with `LDB_MULTI_TENANT=1`:
+96 tests verifying partition prefix isolation across all operations. Requires the service to be running with `LDB_PARTITIONED=1`:
 
 ```bash
-bash tests/integration_multitenant.sh
+bash tests/integration_partitioned.sh
 ```
 
 For instructions on configuring a Kubernetes testing cluster to support the latest `wasm32-wasip3` dependencies natively, please see the [Testing on Kubernetes Setup Guide](TESTING.md).
@@ -255,8 +269,20 @@ lattice-db/
 │   └── workloaddeployment-public.yaml # public OCI deployment example
 └── tests/
     ├── integration.sh      # 94 integration tests
-    └── integration_multitenant.sh  # 96 multi-tenancy isolation tests
+    └── integration_partitioned.sh  # 96 partition prefix tests
 ```
+
+## Roadmap
+
+### Planned for v1.1.0
+- Per-account NATS auth isolation
+- Query performance metrics (latency histograms)
+- Automatic index recommendation engine
+
+### Planned for v2.0.0
+- Distributed query execution
+- Transparent sharding
+- Time-series optimizations
 
 ## License
 

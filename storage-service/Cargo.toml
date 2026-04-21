@@ -1,6 +1,6 @@
 [package]
 name = "storage-service"
-version = "0.2.0"
+version = "1.0.0"
 edition = "2021"
 description = "Self-contained distributed database service — connects to NATS, serves requests, persists to KV"
 license = "Apache-2.0"
@@ -12,7 +12,7 @@ path = "src/main.rs"
 crate-type = ["cdylib"]
 
 [dependencies]
-nats-wasi = { package = "nats-wasip3", version = "0.3" }
+nats-wasi = { package = "nats-wasip3", version = "0.7" }
 wasip3 = "0.5"
 wit-bindgen = { version = "0.54", default-features = false, features = ["async", "async-spawn", "macros"] }
 futures = { version = "0.3", default-features = false, features = ["alloc"] }

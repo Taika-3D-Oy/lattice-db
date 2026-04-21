@@ -25,7 +25,7 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::rc::Rc;
 
-use nats_wasi::client::{Client, Message};
+use nats_wasi::client::{Client, Message, secs};
 use nats_wasi::jetstream::JetStream;
 
 use crate::state::{self, FieldFilter, SharedState};
@@ -34,11 +34,30 @@ use crate::txn;
 
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
 
+// ── Request limits (S-04) ─────────────────────────────────────────────
+
+/// Maximum decoded byte size of a value. Rejects oversized writes before they
+/// reach NATS KV, preventing single-request memory exhaustion.
+const MAX_VALUE_BYTES: usize = 1 * 1024 * 1024; // 1 MiB
+
+/// Maximum byte length of a key.
+const MAX_KEY_LEN: usize = 256;
+
+/// Maximum byte length of a table name (after partition prefix is applied).
+const MAX_TABLE_LEN: usize = 128;
+
+/// Maximum number of entries in a batch.put request.
+const MAX_BATCH_SIZE: usize = 256;
+
 // ── Config ────────────────────────────────────────────────────────────
 
 pub struct Config {
     pub auth_token: Option<String>,
-    pub multi_tenant: bool,
+    /// Partitioned mode: each request must include a `_partition` field whose
+    /// value is prefixed onto the table name. NOTE: partitions are a logical
+    /// key-namespace convenience, NOT a security boundary. Any caller with
+    /// the shared auth token can read any partition by changing `_partition`.
+    pub partitioned: bool,
 }
 
 pub type SharedConfig = Rc<Config>;
@@ -291,9 +310,17 @@ pub async fn handle(client: &Client, js: &JetStream, config: &SharedConfig, stat
         }
     }
 
-    // Tenant prefix: rewrite table name in payload if multi-tenant.
-    let payload = if config.multi_tenant {
-        match apply_tenant_prefix(&msg.payload) {
+    // S-01: reject reserved (_-prefixed) table names before any prefix transformation.
+    let op = msg.subject.strip_prefix("ldb.").unwrap_or(&msg.subject);
+    if let Err(e) = check_no_reserved_tables(op, &msg.payload) {
+        let resp = serde_json::to_vec(&ErrorResp { error: e }).unwrap_or_default();
+        let _ = client.publish(reply_to, &resp);
+        return;
+    }
+
+    // Partition prefix: rewrite table name in payload if partitioned mode is on.
+    let payload = if config.partitioned {
+        match apply_partition_prefix(&msg.payload) {
             Ok(p) => p,
             Err(e) => {
                 let resp = serde_json::to_vec(&ErrorResp { error: e }).unwrap_or_default();
@@ -305,24 +332,23 @@ pub async fn handle(client: &Client, js: &JetStream, config: &SharedConfig, stat
         msg.payload
     };
 
-    let op = msg.subject.strip_prefix("ldb.").unwrap_or(&msg.subject);
-
+    let partitioned = config.partitioned;
     let result = match op {
         "get" => handle_get(state, store, &payload).await,
-        "put" => handle_put(client, state, store, &payload).await,
-        "delete" => handle_delete(client, state, store, &payload).await,
-        "cas" => handle_cas(client, state, store, &payload).await,
-        "create" => handle_create(client, state, store, &payload).await,
+        "put" => handle_put(client, state, store, &payload, partitioned).await,
+        "delete" => handle_delete(client, state, store, &payload, partitioned).await,
+        "cas" => handle_cas(client, state, store, &payload, partitioned).await,
+        "create" => handle_create(client, state, store, &payload, partitioned).await,
         "exists" => handle_exists(state, store, &payload).await,
         "keys" => handle_keys(state, store, &payload).await,
         "scan" => handle_scan(state, store, &payload).await,
         "count" => handle_count(state, store, &payload).await,
         "index.create" => handle_index_create(state, store, &payload).await,
-        "index.drop" => handle_index_drop(state, &payload),
+        "index.drop" => handle_index_drop(state, store, &payload).await,
         "index.list" => handle_index_list(state, &payload),
         "txn" => handle_txn(js, state, store, &payload).await,
         "batch.get" => handle_batch_get(state, store, &payload).await,
-        "batch.put" => handle_batch_put(client, state, store, &payload).await,
+        "batch.put" => handle_batch_put(client, state, store, &payload, partitioned).await,
         "aggregate" => handle_aggregate(state, store, &payload).await,
         "schema.set" => handle_schema_set(state, store, &payload).await,
         "schema.get" => handle_schema_get(state, &payload),
@@ -416,6 +442,8 @@ async fn run_table_watcher(kv: nats_wasi::kv::KeyValue, table: &str, state: &Sha
                     ts.remove(&entry.key);
                 }
             }
+            // `Operation` is `#[non_exhaustive]` since nats-wasip3 0.7; ignore unknown ops.
+            _ => {}
         }
     }
     // If watcher disconnects, mark as not watching so it can be re-spawned.
@@ -452,9 +480,11 @@ async fn handle_put(
     state: &SharedState,
     store: &SharedStore,
     payload: &[u8],
+    partitioned: bool,
 ) -> Result<Vec<u8>, String> {
     let req: PutReq = parse_req(payload)?;
     let value = B64.decode(&req.value).map_err(|e| format!("base64: {e}"))?;
+    validate_write_bounds(&req.table, &req.key, &value)?;
     ensure_loaded(&req.table, state, store).await?;
 
     // Schema validation.
@@ -468,9 +498,12 @@ async fn handle_put(
     let kv = crate::store::get_or_create_kv(store, &req.table)
         .await
         .map_err(|e| format!("{e}"))?;
-    let revision = kv.put(&req.key, &value).await.map_err(|e| format!("{e}"))?;
+    let revision = match req.ttl_seconds {
+        Some(ttl) => kv.put_with_ttl(&req.key, &value, secs(ttl)).await.map_err(|e| format!("{e}"))?,
+        None => kv.put(&req.key, &value).await.map_err(|e| format!("{e}"))?,
+    };
 
-    // Update cache + apply TTL.
+    // Update cache + apply in-memory TTL for fast-path reads.
     {
         let mut s = state.borrow_mut();
         let ts = s.table(&req.table);
@@ -482,7 +515,7 @@ async fn handle_put(
         }
     }
 
-    publish_change(client, "put", &req.table, &req.key, Some(&req.value), Some(revision));
+    publish_change(client, "put", &req.table, &req.key, Some(&req.value), Some(revision), partitioned);
     ok_json(&RevisionResp { revision })
 }
 
@@ -491,6 +524,7 @@ async fn handle_delete(
     state: &SharedState,
     store: &SharedStore,
     payload: &[u8],
+    partitioned: bool,
 ) -> Result<Vec<u8>, String> {
     let req: KeyReq = parse_req(payload)?;
     ensure_loaded(&req.table, state, store).await?;
@@ -503,7 +537,7 @@ async fn handle_delete(
     // Update cache.
     state.borrow_mut().table(&req.table).remove(&req.key);
 
-    publish_change(client, "delete", &req.table, &req.key, None, None);
+    publish_change(client, "delete", &req.table, &req.key, None, None, partitioned);
     ok_json(&EmptyResp {})
 }
 
@@ -512,9 +546,11 @@ async fn handle_cas(
     state: &SharedState,
     store: &SharedStore,
     payload: &[u8],
+    partitioned: bool,
 ) -> Result<Vec<u8>, String> {
     let req: CasReq = parse_req(payload)?;
     let value = B64.decode(&req.value).map_err(|e| format!("base64: {e}"))?;
+    validate_write_bounds(&req.table, &req.key, &value)?;
     ensure_loaded(&req.table, state, store).await?;
 
     // Schema validation.
@@ -528,7 +564,10 @@ async fn handle_cas(
     let kv = crate::store::get_or_create_kv(store, &req.table)
         .await
         .map_err(|e| format!("{e}"))?;
-    let revision = kv.update(&req.key, &value, req.revision).await.map_err(|e| format!("{e}"))?;
+    let revision = match req.ttl_seconds {
+        Some(ttl) => kv.update_with_ttl(&req.key, &value, req.revision, secs(ttl)).await.map_err(|e| format!("{e}"))?,
+        None => kv.update(&req.key, &value, req.revision).await.map_err(|e| format!("{e}"))?,
+    };
 
     {
         let mut s = state.borrow_mut();
@@ -541,7 +580,7 @@ async fn handle_cas(
         }
     }
 
-    publish_change(client, "cas", &req.table, &req.key, Some(&req.value), Some(revision));
+    publish_change(client, "cas", &req.table, &req.key, Some(&req.value), Some(revision), partitioned);
     ok_json(&RevisionResp { revision })
 }
 
@@ -550,9 +589,11 @@ async fn handle_create(
     state: &SharedState,
     store: &SharedStore,
     payload: &[u8],
+    partitioned: bool,
 ) -> Result<Vec<u8>, String> {
     let req: PutReq = parse_req(payload)?;
     let value = B64.decode(&req.value).map_err(|e| format!("base64: {e}"))?;
+    validate_write_bounds(&req.table, &req.key, &value)?;
     ensure_loaded(&req.table, state, store).await?;
 
     // Schema validation.
@@ -566,7 +607,10 @@ async fn handle_create(
     let kv = crate::store::get_or_create_kv(store, &req.table)
         .await
         .map_err(|e| format!("{e}"))?;
-    let revision = kv.create(&req.key, &value).await.map_err(|e| format!("{e}"))?;
+    let revision = match req.ttl_seconds {
+        Some(ttl) => kv.create_with_ttl(&req.key, &value, secs(ttl)).await.map_err(|e| format!("{e}"))?,
+        None => kv.create(&req.key, &value).await.map_err(|e| format!("{e}"))?,
+    };
 
     {
         let mut s = state.borrow_mut();
@@ -579,7 +623,7 @@ async fn handle_create(
         }
     }
 
-    publish_change(client, "create", &req.table, &req.key, Some(&req.value), Some(revision));
+    publish_change(client, "create", &req.table, &req.key, Some(&req.value), Some(revision), partitioned);
     ok_json(&RevisionResp { revision })
 }
 
@@ -760,26 +804,61 @@ async fn handle_index_create(
     let req: IndexCreateReq = parse_req(payload)?;
     ensure_loaded(&req.table, state, store).await?;
 
-    if let Some(fields) = &req.fields {
+    let index_name = if let Some(fields) = &req.fields {
         if fields.len() < 2 {
             return Err("compound index requires at least 2 fields".into());
         }
         state.borrow_mut().table(&req.table).create_compound_index(fields);
+        fields.join("+")
     } else if let Some(ref field) = req.field {
         state.borrow_mut().table(&req.table).create_index(field);
+        field.clone()
     } else {
         return Err("either 'field' or 'fields' is required".into());
-    }
+    };
+
+    // Persist index definition to _indexes bucket.
+    let kv = crate::store::get_or_create_kv(store, "_indexes")
+        .await
+        .map_err(|e| format!("{e}"))?;
+    let index_key = format!("{}.{}", req.table, index_name);
+    let fields_list = if let Some(fields) = &req.fields {
+        fields.clone()
+    } else if let Some(field) = &req.field {
+        vec![field.clone()]
+    } else {
+        return Err("no fields for index".into());
+    };
+    let index_def = serde_json::json!({
+        "table": req.table,
+        "name": index_name,
+        "fields": fields_list,
+    });
+    let index_bytes = serde_json::to_vec(&index_def).map_err(|e| format!("{e}"))?;
+    kv.put(&index_key, &index_bytes).await.map_err(|e| format!("{e}"))?;
 
     ok_json(&EmptyResp {})
 }
 
-fn handle_index_drop(state: &SharedState, payload: &[u8]) -> Result<Vec<u8>, String> {
+async fn handle_index_drop(
+    state: &SharedState,
+    store: &SharedStore,
+    payload: &[u8],
+) -> Result<Vec<u8>, String> {
     let req: FieldReq = parse_req(payload)?;
     let mut s = state.borrow_mut();
     let t = s.table(&req.table);
     t.drop_index(&req.field);
     t.drop_compound_index(&req.field);
+    drop(s); // explicitly drop to release borrow
+
+    // Delete from _indexes bucket.
+    let kv = crate::store::get_or_create_kv(store, "_indexes")
+        .await
+        .map_err(|e| format!("{e}"))?;
+    let index_key = format!("{}.{}", req.table, req.field);
+    let _ = kv.delete(&index_key).await;
+
     ok_json(&EmptyResp {})
 }
 
@@ -850,8 +929,12 @@ async fn handle_batch_put(
     state: &SharedState,
     store: &SharedStore,
     payload: &[u8],
+    partitioned: bool,
 ) -> Result<Vec<u8>, String> {
     let req: BatchPutReq = parse_req(payload)?;
+    if req.entries.len() > MAX_BATCH_SIZE {
+        return Err(format!("batch exceeds maximum of {MAX_BATCH_SIZE} entries"));
+    }
     ensure_loaded(&req.table, state, store).await?;
 
     // Schema validation for all entries upfront.
@@ -872,7 +955,11 @@ async fn handle_batch_put(
     let mut results = Vec::with_capacity(req.entries.len());
     for entry in &req.entries {
         let value = B64.decode(&entry.value).map_err(|e| format!("base64: {e}"))?;
-        let revision = kv.put(&entry.key, &value).await.map_err(|e| format!("{e}"))?;
+        validate_write_bounds(&req.table, &entry.key, &value)?;
+        let revision = match entry.ttl_seconds {
+            Some(ttl) => kv.put_with_ttl(&entry.key, &value, secs(ttl)).await.map_err(|e| format!("{e}"))?,
+            None => kv.put(&entry.key, &value).await.map_err(|e| format!("{e}"))?,
+        };
 
         {
             let mut s = state.borrow_mut();
@@ -885,7 +972,7 @@ async fn handle_batch_put(
             }
         }
 
-        publish_change(client, "put", &req.table, &entry.key, Some(&entry.value), Some(revision));
+        publish_change(client, "put", &req.table, &entry.key, Some(&entry.value), Some(revision), partitioned);
         results.push(BatchPutResult {
             key: entry.key.clone(),
             revision,
@@ -983,6 +1070,7 @@ fn publish_change(
     key: &str,
     value: Option<&str>,
     revision: Option<u64>,
+    partitioned: bool,
 ) {
     let event = ChangeEvent {
         op: op.to_string(),
@@ -992,45 +1080,117 @@ fn publish_change(
         revision,
     };
     if let Ok(bytes) = serde_json::to_vec(&event) {
-        let subject = format!("ldb-events.{table}.{key}");
+        // S-02: in partitioned mode, namespace the subject under the partition
+        // so subscribers can scope to `ldb-events.{partition}.>` without
+        // seeing events from other partitions.
+        let subject = if partitioned {
+            if let Some((partition, base_table)) = table.split_once('_') {
+                format!("ldb-events.{partition}.{base_table}.{key}")
+            } else {
+                format!("ldb-events.{table}.{key}")
+            }
+        } else {
+            format!("ldb-events.{table}.{key}")
+        };
         let _ = client.publish(&subject, &bytes);
     }
 }
 
+/// S-01: reject requests targeting reserved (_-prefixed) table names.
+///
+/// Checked against the raw user-supplied payload, before any partition prefix
+/// transformation, so `_indexes` and `_schemas` are always blocked.
+pub(crate) fn check_no_reserved_tables(op: &str, payload: &[u8]) -> Result<(), String> {
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(payload) else {
+        return Ok(()); // malformed JSON is caught later by parse_req
+    };
+    if op == "txn" {
+        if let Some(ops) = v.get("ops").and_then(|o| o.as_array()) {
+            for entry in ops {
+                if let Some(table) = entry.get("table").and_then(|t| t.as_str()) {
+                    if table.starts_with('_') {
+                        return Err(format!("table name '{table}' is reserved"));
+                    }
+                }
+            }
+        }
+    } else if let Some(table) = v.get("table").and_then(|t| t.as_str()) {
+        if table.starts_with('_') {
+            return Err(format!("table name '{table}' is reserved"));
+        }
+    }
+    Ok(())
+}
+
+/// S-04: validate key and decoded-value sizes before writing to NATS KV.
+pub(crate) fn validate_write_bounds(table: &str, key: &str, value: &[u8]) -> Result<(), String> {
+    if table.len() > MAX_TABLE_LEN {
+        return Err(format!("table name exceeds maximum length of {MAX_TABLE_LEN}"));
+    }
+    if key.len() > MAX_KEY_LEN {
+        return Err(format!("key exceeds maximum length of {MAX_KEY_LEN}"));
+    }
+    if value.len() > MAX_VALUE_BYTES {
+        return Err(format!(
+            "value exceeds maximum size of {} bytes",
+            MAX_VALUE_BYTES
+        ));
+    }
+    Ok(())
+}
+
 /// Check auth token in the request payload.
+///
+/// S-03: uses constant-time comparison to prevent timing-based token oracle attacks.
 fn check_auth(payload: &[u8], expected: &str) -> Result<(), String> {
     let v: serde_json::Value =
         serde_json::from_slice(payload).map_err(|_| "unauthorized".to_string())?;
     let provided = v.get("_auth").and_then(|v| v.as_str()).unwrap_or("");
-    if provided != expected {
+    if !ct_eq(provided.as_bytes(), expected.as_bytes()) {
         return Err("unauthorized".into());
     }
     Ok(())
 }
 
-/// Apply tenant prefix to the table name in the payload.
-fn apply_tenant_prefix(payload: &[u8]) -> Result<Vec<u8>, String> {
+/// Constant-time byte-slice equality. Prevents timing-based token oracle attacks (S-03).
+pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut acc = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        acc |= x ^ y;
+    }
+    acc == 0
+}
+
+/// Apply partition prefix to the table name in the payload.
+///
+/// Partitions are a logical key-namespace convenience. They are NOT a security
+/// boundary — any caller authenticated by the shared `LDB_AUTH_TOKEN` can read
+/// or write any partition by changing the `_partition` field.
+fn apply_partition_prefix(payload: &[u8]) -> Result<Vec<u8>, String> {
     let mut v: serde_json::Value =
         serde_json::from_slice(payload).map_err(|e| format!("invalid request: {e}"))?;
-    let tenant = v
-        .get("_tenant")
+    let partition = v
+        .get("_partition")
         .and_then(|v| v.as_str())
-        .ok_or("_tenant field required in multi-tenant mode")?
+        .ok_or("_partition field required in partitioned mode")?
         .to_string();
-    if tenant.is_empty() || tenant.len() > 64 {
-        return Err("invalid tenant ID".into());
+    if partition.is_empty() || partition.len() > 64 {
+        return Err("invalid partition ID".into());
     }
-    if !tenant.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-') {
-        return Err("invalid tenant ID: only alphanumeric, _, - allowed".into());
+    if !partition.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-') {
+        return Err("invalid partition ID: only alphanumeric, _, - allowed".into());
     }
     if let Some(table) = v.get("table").and_then(|t| t.as_str()).map(|t| t.to_string()) {
-        v["table"] = serde_json::Value::String(format!("{tenant}_{table}"));
+        v["table"] = serde_json::Value::String(format!("{partition}_{table}"));
     }
     // Also prefix table names inside transaction ops (ldb.txn).
     if let Some(ops) = v.get_mut("ops").and_then(|o| o.as_array_mut()) {
         for op in ops.iter_mut() {
             if let Some(table) = op.get("table").and_then(|t| t.as_str()).map(|t| t.to_string()) {
-                op["table"] = serde_json::Value::String(format!("{tenant}_{table}"));
+                op["table"] = serde_json::Value::String(format!("{partition}_{table}"));
             }
         }
     }

@@ -67,6 +67,9 @@ pub async fn get_or_create_kv(store: &SharedStore, table: &str) -> Result<KeyVal
         KvConfig {
             bucket: bucket_name,
             history: 1,
+            // Enable per-message TTL (NATS server 2.11+). This makes TTL
+            // durable across restarts — expired keys are never resurrected.
+            allow_msg_ttl: true,
             ..Default::default()
         },
     )
