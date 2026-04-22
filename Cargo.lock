@@ -224,6 +224,7 @@ name = "lattice-db-client"
 version = "1.1.0"
 dependencies = [
  "base64",
+ "futures",
  "nats-wasip3",
  "serde",
  "serde_json",

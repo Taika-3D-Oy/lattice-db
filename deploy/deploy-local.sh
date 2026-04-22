@@ -75,12 +75,12 @@ check_prereqs
 # ── Build & Push ─────────────────────────────────────────────
 
 build_and_push() {
-  log "Building workspace (release, wasm32-wasip2)"
-  cargo build --workspace --target wasm32-wasip2 --release
+  log "Building workspace (release, wasm32-wasip3)"
+  cargo build --workspace --target wasm32-wasip3 --release
 
   log "Pushing storage-service to local registry"
   wash oci push --insecure "localhost:${REGISTRY_PORT}/lattice-db/storage-service:dev" \
-    target/wasm32-wasip2/release/storage-service.wasm
+    target/wasm32-wasip3/release/storage_service.wasm
 }
 
 # ── Deploy workload with TLS certs ───────────────────────────

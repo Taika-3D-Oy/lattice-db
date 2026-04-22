@@ -1,288 +1,151 @@
 # lattice-db
 
-A NATS-native distributed database built as a WebAssembly component for [wasmCloud](https://wasmcloud.com). It compiles to `wasm32-wasip3`, connects directly to NATS JetStream for persistence, and serves all operations over the NATS request/reply protocol.
+A distributed database that lives entirely inside NATS.
 
-## Architecture
+The engine is a 663 KB `wasm32-wasip3` component. It connects to NATS, subscribes to `ldb.>` in a queue group, persists every table to its own JetStream KV bucket, and serves all CRUD, query, index, and transaction traffic over NATS request/reply.
 
 ```
-clients ──NATS req/rep──▶ storage-service (Wasm component)
+clients ──NATS req/rep──▶ storage-service (Wasm component, 663 KB)
                                 │
                           NATS JetStream KV
-                          (one bucket per table)
+                          (one bucket per table: ldb-{table})
 ```
 
-**Crates:**
+- **JetStream KV as the storage layer.** Tables are buckets. No other persistent state.
+- **Cross-replica cache coherence via KV watchers.** Every replica keeps a local in-memory cache and invalidates entries by subscribing to the bucket's change stream.
+- **Multi-key transactions on top of a JetStream WAL stream.** A dedicated `ldb-txn` stream records PREPARE → apply → COMMIT/ABORT. Crash recovery walks the WAL on startup with a 30-second grace window and a per-txn lock bucket so multiple replicas can recover safely without stepping on each other.
+- **Horizontal scaling via NATS queue groups.** All replicas join `ldb-workers`; NATS distributes requests across them. Add a replica → reads scale linearly.
+- **Stateless components.** A replica can crash, restart, scale up, or scale down without any data migration. The state is in JetStream.
 
-| Crate | Description |
-|---|---|
-| `storage-service` | The database service — in-memory cache, secondary indexes, persistence to NATS KV |
-| [`lattice-db-client`](lattice-db-client/) | Typed Rust SDK — wraps the wire protocol with ergonomic async methods |
-| [`nats-wasip3`](https://crates.io/crates/nats-wasip3) | NATS client for `wasm32-wasip3` — core protocol, JetStream, KV, TLS (published separately) |
+## Performance
 
-All state lives in NATS JetStream KV buckets (one per table, named `ldb-{table}`). The service maintains an in-memory cache for fast reads and writes through to NATS KV for durability.
+Measured on a single Apple M-series machine, release build, loopback NATS 2.12.6, no Raft replication, 1 replica:
+
+| Scenario | Throughput | p50 | p99 |
+|---|---|---|---|
+| Reads (cache hit, 64 concurrent) | **134,100 req/s** | 0.44 ms | 1.19 ms |
+| Writes, 1 table (64 concurrent) | **9,684 req/s** | 5.50 ms | 23.74 ms |
+| Writes, 8 tables (64 concurrent) | **18,580 req/s** | 2.68 ms | 12.14 ms |
+| Transactions, 2-op (8 concurrent) | **499 txn/s** | 1.19 ms | 3.10 ms |
+
+- Reads are served from each replica's in-memory cache; the cost is one NATS round-trip.
+- Multi-table writes scale because each bucket has an independent JetStream stream leader.
+- Transactions are capped by the single global WAL stream — adding replicas does not help, since they all serialize through it.
+
+See [Running the benchmark](#running-the-benchmark) below.
 
 ## Operations
 
-All operations use NATS request/reply on `ldb.{op}` subjects. Request and response bodies are JSON. Values are base64-encoded.
+All requests are NATS request/reply on `ldb.{op}`. Bodies are JSON; binary values are base64-encoded.
 
-### CRUD
+| Subject | Body |
+|---|---|
+| `ldb.get` / `ldb.exists` / `ldb.keys` | `{table, key}` / `{table, cursor?}` |
+| `ldb.put` / `ldb.create` | `{table, key, value, ttl_seconds?}` |
+| `ldb.cas` | `{table, key, value, revision, ttl_seconds?}` |
+| `ldb.delete` | `{table, key}` |
+| `ldb.batch.get` / `ldb.batch.put` | `{table, keys: [...]}` / `{table, entries: [...]}` |
+| `ldb.scan` / `ldb.count` | `{table, filters, order_by?, limit?, offset?, key_prefix?}` |
+| `ldb.aggregate` | `{table, filters, group_by?, ops: [{fn, field?}]}` (`count`/`sum`/`avg`/`min`/`max`) |
+| `ldb.index.create` / `ldb.index.drop` / `ldb.index.list` | `{table, field}` or `{table, fields: [...]}` (compound) |
+| `ldb.txn` | `{ops: [{op, table, key, value?}]}` — atomic, max 64 ops |
+| `ldb.schema.set` / `ldb.schema.get` / `ldb.schema.delete` | `{table, schema}` |
 
-| Subject | Request | Response |
-|---|---|---|
-| `ldb.get` | `{table, key}` | `{key, value, revision}` |
-| `ldb.put` | `{table, key, value, ttl_seconds?}` | `{revision}` |
-| `ldb.delete` | `{table, key}` | `{}` |
-| `ldb.create` | `{table, key, value, ttl_seconds?}` | `{revision}` |
-| `ldb.cas` | `{table, key, value, revision, ttl_seconds?}` | `{revision}` |
-| `ldb.exists` | `{table, key}` | `{exists}` |
-| `ldb.keys` | `{table, cursor?}` | `{keys, cursor?}` |
+Filters use `eq`, `neq`, `gt`, `gte`, `lt`, `lte`, `prefix`. Schemas validate `put` / `create` / `cas` / `batch.put`.
 
-### Batch
-
-| Subject | Request | Response |
-|---|---|---|
-| `ldb.batch.get` | `{table, keys: [...]}` | `{results: [{key, value?, revision?, error?}]}` |
-| `ldb.batch.put` | `{table, entries: [{key, value, ttl_seconds?}]}` | `{results: [{key, revision}]}` |
-
-### Query
-
-| Subject | Request | Response |
-|---|---|---|
-| `ldb.scan` | `{table, filters, order_by?, limit?, offset?, key_prefix?}` | `{rows, total_count}` |
-| `ldb.count` | `{table, filters}` | `{count}` |
-
-**Filters** support `eq`, `neq`, `gt`, `gte`, `lt`, `lte`, `prefix` operators:
-
-```json
-{"field": "city", "op": "eq", "value": "Helsinki"}
-```
-
-### Indexes
-
-| Subject | Request | Response |
-|---|---|---|
-| `ldb.index.create` | `{table, field}` or `{table, fields: ["a","b"]}` | `{}` |
-| `ldb.index.drop` | `{table, field}` | `{}` |
-| `ldb.index.list` | `{table}` | `{indexes}` |
-
-Single-field and compound (multi-field) indexes are supported. Compound indexes are named `field1+field2`.
-
-### Aggregation
-
-| Subject | Request | Response |
-|---|---|---|
-| `ldb.aggregate` | `{table, filters, group_by?, ops: [{fn, field?}]}` | `{groups: [{key?, results}]}` |
-
-Supported functions: `count`, `sum`, `avg`, `min`, `max`.
-
-```json
-{
-  "table": "sales",
-  "filters": [],
-  "group_by": "region",
-  "ops": [{"fn": "count"}, {"fn": "sum", "field": "amount"}]
-}
-```
-
-### Transactions
-
-| Subject | Request | Response |
-|---|---|---|
-| `ldb.txn` | `{ops: [{op, table, key, value?}]}` | `{ok, results}` |
-
-Multi-key atomic writes backed by a write-ahead log (WAL) in JetStream. Supports `put`, `create`, `delete` operations. Max 64 ops per transaction. Automatic rollback on failure, crash recovery on startup.
-
-### Schema Validation
-
-| Subject | Request | Response |
-|---|---|---|
-| `ldb.schema.set` | `{table, schema}` | `{}` |
-| `ldb.schema.get` | `{table}` | `{schema}` |
-| `ldb.schema.delete` | `{table}` | `{}` |
-
-Schema format:
-
-```json
-{
-  "fields": {
-    "name": {"type": "string", "required": true},
-    "age": {"type": "number"},
-    "active": {"type": "boolean"}
-  }
-}
-```
-
-When a schema is set, all `put`, `create`, `cas`, and `batch.put` operations validate against it.
-
-### TTL / Expiry
-
-Add `ttl_seconds` to any write operation (`put`, `create`, `cas`, `batch.put`):
-
-```json
-{"table": "sessions", "key": "abc", "value": "...", "ttl_seconds": 3600}
-```
-
-Expired keys are invisible to `get`, `exists`, `keys`, `scan`, and `count`.
-
-### Watch / Change Events
-
-Every mutation publishes a change event on `ldb-events.{table}.{key}`:
-
-```json
-{"op": "put", "table": "users", "key": "alice", "value": "...", "revision": 42}
-```
-
-Subscribe with the NATS CLI:
+Every mutation also publishes a change event on `ldb-events.{table}.{key}`:
 
 ```bash
-nats sub "ldb-events.users.>"      # all changes to the users table
-nats sub "ldb-events.>"            # all changes across all tables
+nats sub "ldb-events.users.>"
 ```
 
-## Auth & Multi-Tenancy
+## Auth & multi-tenancy
 
-Both are opt-in via environment variables. **Important:** This implementation provides organization/partitioning only, not cryptographic isolation.
+Both opt-in, both shared-secret. **Not cryptographic isolation** — use NATS NKey/JWT or separate accounts for that.
 
-**Auth token** — set `LDB_AUTH_TOKEN` and every request must include `"_auth": "<token>"` in the JSON body:
+| Env var | Effect |
+|---|---|
+| `LDB_AUTH_TOKEN=...` | Every request must include `"_auth": "<token>"` |
+| `LDB_PARTITIONED=1` | Every request must include `"_partition": "<id>"`; the id is prefixed onto the table name |
 
-```bash
-LDB_AUTH_TOKEN=my-secret
-```
+## Build & run
 
-⚠️ **Security notes:**
-- The token is a single shared secret across all clients.
-- Tokens are sent in plaintext in the JSON message body (not in NATS headers).
-- No per-client identity, rotation, or replay protection.
-- Suitable only for internal networks with trusted clients.
-- For production untrusted networks, use NATS NKey/JWT authentication instead.
-
-**Partitioned mode** — set `LDB_PARTITIONED=1` and every request must include `"_partition": "<id>"`. The partition ID is transparently prefixed to table names:
-
-```bash
-LDB_PARTITIONED=1
-```
-
-⚠️ **Partition model:**
-- Partitions are a **logical key-namespace convenience**, not a security boundary.
-- Any client with the shared auth token can access any partition by changing the `_partition` field.
-- For cryptographic isolation, use NATS account/permission-based separation, or run a separate lattice-db instance per security domain.
-- Suitable for: operator-owned services where all clients are internal/trusted and partitioning is just a key namespace.
-- Not suitable for: customer-facing SaaS without additional auth/RBAC layers.
-
-## Build
-
-Requires Rust nightly (for `wasm32-wasip3` build-std). The included `rust-toolchain.toml` and `.cargo/config.toml` handle all configuration:
+Requires Rust nightly (the `rust-toolchain.toml` pins it). Output is `target/wasm32-wasip3/release/storage_service.wasm` (663 KB).
 
 ```bash
 cargo build --release
-```
 
-The output binary is at `target/wasm32-wasip3/release/storage_service.wasm`.
-
-## Run Locally
-
-### With wasmtime
-
-```bash
-wasmtime run -S inherit-network -S p3=y \
-  --env NATS_URL=127.0.0.1:4222 \
+# Run with wasmtime against a local NATS server
+nats-server -js -p 14222 &
+wasmtime run -S p3=y -S inherit-network=y -W component-model-async=y \
+  --env NATS_URL=127.0.0.1:14222 \
   target/wasm32-wasip3/release/storage_service.wasm
 ```
 
-Requires a running NATS server with JetStream enabled:
+For a full Kind + wasmCloud + mTLS local environment:
 
 ```bash
-nats-server -js
-```
-
-### On Kubernetes (Kind)
-
-The included deploy script sets up a complete local environment — Kind cluster, NATS with JetStream and mTLS, wasmCloud host, and the storage service:
-
-```bash
-# Full setup from scratch
-bash deploy/deploy-local.sh
-
-# Rebuild and redeploy the service only
-bash deploy/deploy-local.sh rebuild
-
-# Tear down everything
+bash deploy/deploy-local.sh           # full setup
+bash deploy/deploy-local.sh rebuild   # rebuild service only
 bash deploy/deploy-local.sh teardown
 ```
 
-Prerequisites: `kind`, `kubectl`, `helm`, `docker`, `cargo`, `wash`
+Prerequisites: `kind`, `kubectl`, `helm`, `docker`, `cargo`, `wash`. The wasmCloud host must have wasip3 enabled (`wash host --wasip3`).
 
-### Public Registry Deployment
-
-If you want to include `lattice-db` directly in another wasmCloud setup, publish
-`storage_service.wasm` to an OCI registry and use
-`deploy/workloaddeployment-public.yaml` as the drop-in manifest.
-
-```bash
-kubectl apply -f deploy/workloaddeployment-public.yaml
-```
-
-Important: `lattice-db` is built for `wasm32-wasip3`. The target wasmCloud host
-must have wasip3 enabled (for example, `wash host --wasip3`).
+For a public-registry deployment, push `storage_service.wasm` to OCI and apply [`deploy/workloaddeployment-public.yaml`](deploy/workloaddeployment-public.yaml).
 
 ## Test
 
-190 integration tests covering all operations:
+```bash
+bash tests/integration.sh             # 190 tests, plain local NATS
+bash tests/integration.sh --tls       # against the Kind cluster with mTLS
+bash tests/integration_partitioned.sh # 96 partition isolation tests (needs LDB_PARTITIONED=1)
+```
+
+Requires `nats` CLI, `jq`, `base64`. See [TESTING.md](TESTING.md) for Kubernetes setup.
+
+## Running the benchmark
 
 ```bash
-# Against a plain local NATS server
-bash tests/integration.sh
+cargo build --target wasm32-wasip3 --release --example bench -p lattice-db-client
 
-# Against the Kind cluster with mTLS
-bash tests/integration.sh --tls
+nats-server -js -p 14222 &
+wasmtime run -S p3=y -S inherit-network=y -W component-model-async=y \
+  --env NATS_URL=127.0.0.1:14222 \
+  target/wasm32-wasip3/release/storage_service.wasm &
+
+wasmtime run -S p3=y -S inherit-network=y -W component-model-async=y \
+  --env NATS_URL=127.0.0.1:14222 \
+  --env BENCH_DURATION_SECS=10 \
+  --env BENCH_CONCURRENCY=64 \
+  --env BENCH_TXN_CONCURRENCY=8 \
+  target/wasm32-wasip3/release/examples/bench.wasm
 ```
 
-### Partition Tests
+Tunables: `BENCH_DURATION_SECS` (10), `BENCH_CONCURRENCY` (64), `BENCH_TXN_CONCURRENCY` (8), `BENCH_MSG_SIZE` (256), `BENCH_TABLES` (8), `BENCH_TXN_OPS` (2).
 
-96 tests verifying partition prefix isolation across all operations. Requires the service to be running with `LDB_PARTITIONED=1`:
-
-```bash
-bash tests/integration_partitioned.sh
-```
-
-For instructions on configuring a Kubernetes testing cluster to support the latest `wasm32-wasip3` dependencies natively, please see the [Testing on Kubernetes Setup Guide](TESTING.md).
-
-Requires: `nats` CLI, `jq`, `base64`
-
-## Project Structure
+## Project layout
 
 ```
-lattice-db/
-├── Cargo.toml              # workspace root
-├── storage-service/        # the database service (wasm component)
-│   └── src/
-│       ├── main.rs         # entry point, NATS connection, WAL recovery
-│       ├── handler.rs      # request dispatch for all operations
-│       ├── state.rs        # in-memory cache, indexes, query engine, aggregation
-│       ├── store.rs        # NATS KV persistence layer
-│       └── txn.rs          # WAL-backed transactions
-├── lattice-db-client/      # typed Rust SDK (published on crates.io)
-│   └── src/
-│       └── lib.rs          # LatticeDb struct with all typed methods
-├── deploy/
-│   ├── deploy-local.sh               # Kind cluster setup and deployment
-│   └── workloaddeployment-public.yaml # public OCI deployment example
-└── tests/
-    ├── integration.sh      # 94 integration tests
-    └── integration_partitioned.sh  # 96 partition prefix tests
+storage-service/    # the database (wasm component)
+  src/main.rs       #   NATS connection, queue subscription, watchers, WAL recovery
+  src/handler.rs    #   request dispatch for all ldb.* operations
+  src/state.rs      #   in-memory cache, indexes, query engine, aggregation
+  src/store.rs      #   NATS KV persistence
+  src/txn.rs        #   WAL-backed transactions
+lattice-db-client/  # typed Rust SDK (published on crates.io)
+  examples/bench.rs #   the benchmark used above
+deploy/             # Kind + wasmCloud local environment
+tests/              # integration test suites
 ```
 
-## Roadmap
+## Crates
 
-### Planned for v1.1.0
-- Per-account NATS auth isolation
-- Query performance metrics (latency histograms)
-- Automatic index recommendation engine
-
-### Planned for v2.0.0
-- Distributed query execution
-- Transparent sharding
-- Time-series optimizations
+| Crate | Description |
+|---|---|
+| `storage-service` | The database service |
+| [`lattice-db-client`](lattice-db-client/) | Typed Rust SDK |
+| [`nats-wasip3`](https://crates.io/crates/nats-wasip3) | NATS client for `wasm32-wasip3` (published separately) |
 
 ## License
 

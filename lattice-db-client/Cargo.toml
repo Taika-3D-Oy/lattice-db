@@ -19,7 +19,12 @@ wit-bindgen = { version = "0.54", default-features = false, features = ["async",
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = { version = "0.22", default-features = false, features = ["alloc"] }
+futures = { version = "0.3", default-features = false, features = ["alloc"] }
 
 [[example]]
 name = "smoke_test"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "bench"
 crate-type = ["cdylib"]
