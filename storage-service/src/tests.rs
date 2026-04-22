@@ -2,7 +2,7 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::state::{FieldFilter, Comparison, matches_filters};
+    use crate::state::{matches_filters, Comparison, FieldFilter};
 
     // ──────────────────────────────────────────────────────────────────
     // Filter & Index Tests
@@ -470,4 +470,3 @@ mod tests {
         assert!(output.contains("\\t"));
     }
 }
-

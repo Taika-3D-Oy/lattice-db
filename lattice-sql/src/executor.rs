@@ -1,9 +1,7 @@
 //! Query executor — takes a plan and executes it against lattice-db
 //! via the client SDK, returning result sets.
 
-use lattice_db_client::{
-    AggOp as ClientAggOp, Filter, LatticeDb, ScanQuery,
-};
+use lattice_db_client::{AggOp as ClientAggOp, Filter, LatticeDb, ScanQuery};
 use serde_json::Value as JsonValue;
 
 use crate::catalog::{Catalog, ColumnType};
@@ -128,12 +126,7 @@ async fn exec_aggregate(plan: AggregatePlan, db: &LatticeDb) -> Result<ResultSet
         .collect();
 
     let groups = db
-        .aggregate(
-            &plan.table,
-            &filters,
-            plan.group_by.as_deref(),
-            &client_ops,
-        )
+        .aggregate(&plan.table, &filters, plan.group_by.as_deref(), &client_ops)
         .await
         .map_err(|e| format!("aggregate failed: {e}"))?;
 
@@ -236,7 +229,11 @@ async fn exec_join(plan: JoinPlan, db: &LatticeDb) -> Result<ResultSet, String> 
                 let va = &a[idx];
                 let vb = &b[idx];
                 let cmp = cmp_json_values(va, vb);
-                if asc { cmp } else { cmp.reverse() }
+                if asc {
+                    cmp
+                } else {
+                    cmp.reverse()
+                }
             });
         }
     }
@@ -312,9 +309,8 @@ async fn exec_insert(
             obj.insert(col.clone(), json_val);
         }
 
-        let pk = pk_value.ok_or_else(|| {
-            format!("INSERT missing primary key column '{}'", plan.pk_column)
-        })?;
+        let pk = pk_value
+            .ok_or_else(|| format!("INSERT missing primary key column '{}'", plan.pk_column))?;
 
         // Validate NOT NULL constraints.
         for col_def in &table_def.columns {

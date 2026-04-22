@@ -9,46 +9,18 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 
-// ── Monotonic clock for TTL tracking ───────────────────────────────
-
-thread_local! {
-    /// Epoch timestamp in nanoseconds (P3 monotonic clock).
-    static EPOCH_NS: RefCell<u64> = const { RefCell::new(0) };
-}
-
-/// Initialize the monotonic clock. Call once at startup.
-pub fn init_clock() {
-    EPOCH_NS.with(|e| {
-        *e.borrow_mut() = wasip3::clocks::monotonic_clock::now();
-    });
-}
-
-/// Current monotonic time in milliseconds since service start.
-pub fn clock_ms() -> u64 {
-    EPOCH_NS.with(|e| {
-        let epoch = *e.borrow();
-        let now = wasip3::clocks::monotonic_clock::now();
-        (now.saturating_sub(epoch)) / 1_000_000
-    })
-}
-
-/// A cached row: value bytes + NATS KV revision + optional TTL.
+/// A cached row: value bytes + NATS KV revision.
+///
+/// TTL-based expiry is handled solely by the NATS server (per-message TTL via
+/// the `Nats-TTL` header, requires NATS 2.11+ with `allow_msg_ttl: true`).
+/// When a key expires the server emits `Operation::Delete` to every KV watcher,
+/// so all replicas remove the key uniformly. Local expiry tracking would create
+/// an inconsistency window where the originating replica hid a key that peers
+/// were still serving.
 #[derive(Clone, Debug)]
 pub struct CachedRow {
     pub value: Vec<u8>,
     pub revision: u64,
-    /// Monotonic clock ms at which this entry expires. None = no TTL.
-    pub expires_at_ms: Option<u64>,
-}
-
-impl CachedRow {
-    /// Check if this row has expired.
-    pub fn is_expired(&self) -> bool {
-        match self.expires_at_ms {
-            Some(exp) => clock_ms() >= exp,
-            None => false,
-        }
-    }
 }
 
 /// A compound (multi-field) secondary index.
@@ -98,10 +70,8 @@ impl TableState {
         self.add_to_indexes(key, &value);
         self.add_to_compound_indexes(key, &value);
 
-        self.data.insert(
-            key.to_string(),
-            CachedRow { value, revision, expires_at_ms: None },
-        );
+        self.data
+            .insert(key.to_string(), CachedRow { value, revision });
     }
 
     /// Remove a row from the cache and all indexes.
@@ -141,10 +111,18 @@ impl TableState {
         let mut data = BTreeMap::new();
         for (key, row) in &self.data {
             if let Some(composite) = compound_index_key(&row.value, fields) {
-                data.entry(composite).or_insert_with(Vec::new).push(key.clone());
+                data.entry(composite)
+                    .or_insert_with(Vec::new)
+                    .push(key.clone());
             }
         }
-        self.compound_indexes.insert(name, CompoundIndex { fields: fields.to_vec(), data });
+        self.compound_indexes.insert(
+            name,
+            CompoundIndex {
+                fields: fields.to_vec(),
+                data,
+            },
+        );
     }
 
     /// Drop a compound index by name (e.g., "field1+field2").
@@ -157,7 +135,9 @@ impl TableState {
     fn add_to_indexes(&mut self, key: &str, value: &[u8]) {
         for (field, idx) in &mut self.indexes {
             if let Some(val) = extract_json_field(value, field) {
-                idx.entry(val).or_insert_with(Vec::new).push(key.to_string());
+                idx.entry(val)
+                    .or_insert_with(Vec::new)
+                    .push(key.to_string());
             }
         }
     }
@@ -179,7 +159,10 @@ impl TableState {
     fn add_to_compound_indexes(&mut self, key: &str, value: &[u8]) {
         for ci in self.compound_indexes.values_mut() {
             if let Some(composite) = compound_index_key(value, &ci.fields) {
-                ci.data.entry(composite).or_insert_with(Vec::new).push(key.to_string());
+                ci.data
+                    .entry(composite)
+                    .or_insert_with(Vec::new)
+                    .push(key.to_string());
             }
         }
     }
@@ -216,24 +199,6 @@ impl State {
         self.tables
             .entry(name.to_string())
             .or_insert_with(TableState::new)
-    }
-
-    /// Remove expired entries from all tables. Returns count of reaped entries.
-    pub fn reap_expired(&mut self) -> u64 {
-        let mut reaped = 0u64;
-        for table in self.tables.values_mut() {
-            let expired_keys: Vec<String> = table
-                .data
-                .iter()
-                .filter(|(_, row)| row.is_expired())
-                .map(|(k, _)| k.clone())
-                .collect();
-            for key in &expired_keys {
-                table.remove(key);
-                reaped += 1;
-            }
-        }
-        reaped
     }
 }
 
@@ -366,10 +331,7 @@ pub fn matches_filters(value: &[u8], filters: &[FieldFilter]) -> bool {
 
 /// Collect matching keys using an index if one covers the first filters.
 /// Tries compound indexes first (if multiple filters), then single-field indexes.
-pub fn index_scan(
-    table: &TableState,
-    filters: &[FieldFilter],
-) -> Option<Vec<String>> {
+pub fn index_scan(table: &TableState, filters: &[FieldFilter]) -> Option<Vec<String>> {
     if filters.is_empty() {
         return None;
     }
@@ -384,7 +346,9 @@ pub fn index_scan(
                     .iter()
                     .enumerate()
                     .all(|(i, f)| f.field == compound_idx.fields[i])
-                    && filters[..field_count].iter().all(|f| matches!(f.cmp, Comparison::Eq(_)))
+                && filters[..field_count]
+                    .iter()
+                    .all(|f| matches!(f.cmp, Comparison::Eq(_)))
             {
                 // All filters up to field_count are Eq comparisons on the right fields.
                 // Build the composite key and look it up.
@@ -397,7 +361,11 @@ pub fn index_scan(
                     }
                 }
                 let composite_key = parts.join("\x1f");
-                let mut keys = compound_idx.data.get(&composite_key).cloned().unwrap_or_default();
+                let mut keys = compound_idx
+                    .data
+                    .get(&composite_key)
+                    .cloned()
+                    .unwrap_or_default();
 
                 // Filter the remaining filters post-index (if any).
                 if field_count < filters.len() {
@@ -432,27 +400,24 @@ pub fn index_scan(
             }
             keys
         }
-        Comparison::Gte(v) => {
-            idx.range(v.clone()..)
-                .flat_map(|(_, ks)| ks.iter().cloned())
-                .collect()
-        }
+        Comparison::Gte(v) => idx
+            .range(v.clone()..)
+            .flat_map(|(_, ks)| ks.iter().cloned())
+            .collect(),
         Comparison::Gt(v) => {
             let start = format!("{v}\0");
             idx.range(start..)
                 .flat_map(|(_, ks)| ks.iter().cloned())
                 .collect()
         }
-        Comparison::Lt(v) => {
-            idx.range(..v.clone())
-                .flat_map(|(_, ks)| ks.iter().cloned())
-                .collect()
-        }
-        Comparison::Lte(v) => {
-            idx.range(..=v.clone())
-                .flat_map(|(_, ks)| ks.iter().cloned())
-                .collect()
-        }
+        Comparison::Lt(v) => idx
+            .range(..v.clone())
+            .flat_map(|(_, ks)| ks.iter().cloned())
+            .collect(),
+        Comparison::Lte(v) => idx
+            .range(..=v.clone())
+            .flat_map(|(_, ks)| ks.iter().cloned())
+            .collect(),
         Comparison::Neq(_) => return None,
     };
 
@@ -503,7 +468,7 @@ pub fn aggregate(
     let matching: Vec<(&String, &CachedRow)> = table
         .data
         .iter()
-        .filter(|(_, row)| !row.is_expired() && matches_filters(&row.value, filters))
+        .filter(|(_, row)| matches_filters(&row.value, filters))
         .collect();
 
     let mut groups: HashMap<Option<String>, Vec<(&String, &CachedRow)>> = HashMap::new();
@@ -516,7 +481,10 @@ pub fn aggregate(
         .into_iter()
         .map(|(group_key, rows)| {
             let results = ops.iter().map(|op| compute_agg(op, &rows)).collect();
-            AggGroup { key: group_key, results }
+            AggGroup {
+                key: group_key,
+                results,
+            }
         })
         .collect();
     result.sort_by(|a, b| a.key.cmp(&b.key));

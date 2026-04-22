@@ -2,11 +2,10 @@
 //! internal statement types.
 
 use sqlparser::ast::{
-    self, AssignmentTarget, ColumnDef as SqlColumnDef, ColumnOption, DataType,
-    Expr, FromTable, FunctionArg, FunctionArgExpr, GroupByExpr, ObjectName,
-    OrderByKind, SelectItem, SetExpr, Statement, TableFactor, TableObject,
-    TableWithJoins, UnaryOperator, Value,
-    JoinConstraint, JoinOperator,
+    self, AssignmentTarget, ColumnDef as SqlColumnDef, ColumnOption, DataType, Expr, FromTable,
+    FunctionArg, FunctionArgExpr, GroupByExpr, JoinConstraint, JoinOperator, ObjectName,
+    OrderByKind, SelectItem, SetExpr, Statement, TableFactor, TableObject, TableWithJoins,
+    UnaryOperator, Value,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -42,9 +41,17 @@ pub struct SelectStmt {
 
 #[derive(Debug, Clone)]
 pub enum SelectColumn {
-    Column { table: Option<String>, name: String },
-    Star { table: Option<String> },
-    Aggregate { fn_name: String, field: Option<String> },
+    Column {
+        table: Option<String>,
+        name: String,
+    },
+    Star {
+        table: Option<String>,
+    },
+    Aggregate {
+        fn_name: String,
+        field: Option<String>,
+    },
 }
 
 #[derive(Debug)]
@@ -86,13 +93,25 @@ pub enum WhereExpr {
     And(Box<WhereExpr>, Box<WhereExpr>),
     Or(Box<WhereExpr>, Box<WhereExpr>),
     Not(Box<WhereExpr>),
-    IsNull { field: String, table: Option<String> },
-    IsNotNull { field: String, table: Option<String> },
+    IsNull {
+        field: String,
+        table: Option<String>,
+    },
+    IsNotNull {
+        field: String,
+        table: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
 pub enum CmpOp {
-    Eq, Neq, Lt, Lte, Gt, Gte, Like,
+    Eq,
+    Neq,
+    Lt,
+    Lte,
+    Gt,
+    Gte,
+    Like,
 }
 
 #[derive(Debug)]
@@ -165,14 +184,20 @@ fn convert_statement(stmt: Statement) -> Result<SqlStatement, String> {
     match stmt {
         Statement::Query(query) => convert_select(*query),
         Statement::Insert(insert) => convert_insert(insert),
-        Statement::Update { table, assignments, selection, .. } => {
-            convert_update(table, assignments, selection)
-        }
+        Statement::Update {
+            table,
+            assignments,
+            selection,
+            ..
+        } => convert_update(table, assignments, selection),
         Statement::Delete(delete) => convert_delete(delete),
         Statement::CreateTable(ct) => convert_create_table(ct),
-        Statement::Drop { object_type, names, if_exists, .. } => {
-            convert_drop(object_type, names, if_exists)
-        }
+        Statement::Drop {
+            object_type,
+            names,
+            if_exists,
+            ..
+        } => convert_drop(object_type, names, if_exists),
         Statement::CreateIndex(ci) => convert_create_index(ci),
         _ => Err("unsupported statement type".into()),
     }
@@ -205,7 +230,9 @@ fn convert_select(query: ast::Query) -> Result<SqlStatement, String> {
     let group_by = match &body.group_by {
         GroupByExpr::Expressions(exprs, _) => exprs
             .iter()
-            .map(|e| expr_to_column_name(e).ok_or_else(|| "unsupported GROUP BY expression".to_string()))
+            .map(|e| {
+                expr_to_column_name(e).ok_or_else(|| "unsupported GROUP BY expression".to_string())
+            })
             .collect::<Result<Vec<_>, _>>()?,
         GroupByExpr::All(_) => Vec::new(),
     };
@@ -219,7 +246,10 @@ fn convert_select(query: ast::Query) -> Result<SqlStatement, String> {
                 .map(|item| {
                     let field = expr_to_column_name(&item.expr)
                         .ok_or_else(|| "unsupported ORDER BY expression".to_string())?;
-                    Ok(OrderByItem { field, asc: item.options.asc.unwrap_or(true) })
+                    Ok(OrderByItem {
+                        field,
+                        asc: item.options.asc.unwrap_or(true),
+                    })
                 })
                 .collect::<Result<Vec<_>, String>>(),
             OrderByKind::All(_) => Ok(Vec::new()),
@@ -228,7 +258,14 @@ fn convert_select(query: ast::Query) -> Result<SqlStatement, String> {
         .unwrap_or_default();
 
     Ok(SqlStatement::Select(SelectStmt {
-        columns, from, joins, where_clause, group_by, order_by, limit, offset,
+        columns,
+        from,
+        joins,
+        where_clause,
+        group_by,
+        order_by,
+        limit,
+        offset,
     }))
 }
 
@@ -239,12 +276,16 @@ fn convert_select_item(item: &SelectItem) -> Result<SelectColumn, String> {
         SelectItem::Wildcard(_) => Ok(SelectColumn::Star { table: None }),
         SelectItem::QualifiedWildcard(kind, _) => {
             let table_name = match kind {
-                ast::SelectItemQualifiedWildcardKind::ObjectName(name) => object_name_to_string(name),
+                ast::SelectItemQualifiedWildcardKind::ObjectName(name) => {
+                    object_name_to_string(name)
+                }
                 ast::SelectItemQualifiedWildcardKind::Expr(expr) => {
                     expr_to_column_name(expr).unwrap_or_default()
                 }
             };
-            Ok(SelectColumn::Star { table: Some(table_name) })
+            Ok(SelectColumn::Star {
+                table: Some(table_name),
+            })
         }
     }
 }
@@ -252,10 +293,12 @@ fn convert_select_item(item: &SelectItem) -> Result<SelectColumn, String> {
 fn convert_select_expr(expr: &Expr) -> Result<SelectColumn, String> {
     match expr {
         Expr::Identifier(ident) => Ok(SelectColumn::Column {
-            table: None, name: ident.value.clone(),
+            table: None,
+            name: ident.value.clone(),
         }),
         Expr::CompoundIdentifier(parts) if parts.len() == 2 => Ok(SelectColumn::Column {
-            table: Some(parts[0].value.clone()), name: parts[1].value.clone(),
+            table: Some(parts[0].value.clone()),
+            name: parts[1].value.clone(),
         }),
         Expr::Function(func) => {
             let fn_name = object_name_to_string(&func.name).to_uppercase();
@@ -293,7 +336,10 @@ fn convert_from(from: &[TableWithJoins]) -> Result<(FromClause, Vec<JoinClause>)
             _ => return Err("only ON join condition is supported".into()),
         };
         joins.push(JoinClause {
-            table: table_info.table, alias: table_info.alias, join_type, on,
+            table: table_info.table,
+            alias: table_info.alias,
+            join_type,
+            on,
         });
     }
 
@@ -312,12 +358,21 @@ fn convert_table_factor(tf: &TableFactor) -> Result<FromClause, String> {
 
 fn convert_join_on(expr: &Expr) -> Result<JoinCondition, String> {
     match expr {
-        Expr::BinaryOp { left, op: ast::BinaryOperator::Eq, right } => {
+        Expr::BinaryOp {
+            left,
+            op: ast::BinaryOperator::Eq,
+            right,
+        } => {
             let (lt, lc) = expr_to_qualified_column(left)
                 .ok_or("left side of ON must be a column reference")?;
             let (rt, rc) = expr_to_qualified_column(right)
                 .ok_or("right side of ON must be a column reference")?;
-            Ok(JoinCondition { left_table: lt, left_col: lc, right_table: rt, right_col: rc })
+            Ok(JoinCondition {
+                left_table: lt,
+                left_col: lc,
+                right_table: rt,
+                right_col: rc,
+            })
         }
         _ => Err("only simple equality conditions are supported in ON".into()),
     }
@@ -328,31 +383,39 @@ fn convert_join_on(expr: &Expr) -> Result<JoinCondition, String> {
 fn convert_expr(expr: &Expr) -> Result<WhereExpr, String> {
     match expr {
         Expr::BinaryOp { left, op, right } => match op {
-            ast::BinaryOperator::And => {
-                Ok(WhereExpr::And(Box::new(convert_expr(left)?), Box::new(convert_expr(right)?)))
-            }
-            ast::BinaryOperator::Or => {
-                Ok(WhereExpr::Or(Box::new(convert_expr(left)?), Box::new(convert_expr(right)?)))
-            }
+            ast::BinaryOperator::And => Ok(WhereExpr::And(
+                Box::new(convert_expr(left)?),
+                Box::new(convert_expr(right)?),
+            )),
+            ast::BinaryOperator::Or => Ok(WhereExpr::Or(
+                Box::new(convert_expr(left)?),
+                Box::new(convert_expr(right)?),
+            )),
             _ => {
                 let (table, field) = expr_to_qualified_column(left)
                     .ok_or("left side of comparison must be a column")?;
                 let value = expr_to_value(right)
                     .ok_or("right side of comparison must be a literal value")?;
-                Ok(WhereExpr::Comparison { field, table, op: convert_binop(op)?, value })
+                Ok(WhereExpr::Comparison {
+                    field,
+                    table,
+                    op: convert_binop(op)?,
+                    value,
+                })
             }
         },
-        Expr::UnaryOp { op: UnaryOperator::Not, expr: inner } => {
-            Ok(WhereExpr::Not(Box::new(convert_expr(inner)?)))
-        }
+        Expr::UnaryOp {
+            op: UnaryOperator::Not,
+            expr: inner,
+        } => Ok(WhereExpr::Not(Box::new(convert_expr(inner)?))),
         Expr::IsNull(inner) => {
-            let (table, field) = expr_to_qualified_column(inner)
-                .ok_or("IS NULL requires a column reference")?;
+            let (table, field) =
+                expr_to_qualified_column(inner).ok_or("IS NULL requires a column reference")?;
             Ok(WhereExpr::IsNull { field, table })
         }
         Expr::IsNotNull(inner) => {
-            let (table, field) = expr_to_qualified_column(inner)
-                .ok_or("IS NOT NULL requires a column reference")?;
+            let (table, field) =
+                expr_to_qualified_column(inner).ok_or("IS NOT NULL requires a column reference")?;
             Ok(WhereExpr::IsNotNull { field, table })
         }
         Expr::Nested(inner) => convert_expr(inner),
@@ -386,12 +449,20 @@ fn convert_insert(insert: ast::Insert) -> Result<SqlStatement, String> {
         SetExpr::Values(values) => values
             .rows
             .iter()
-            .map(|row| row.iter().map(|e| expr_to_value(e).unwrap_or_default()).collect())
+            .map(|row| {
+                row.iter()
+                    .map(|e| expr_to_value(e).unwrap_or_default())
+                    .collect()
+            })
             .collect(),
         _ => return Err("only INSERT ... VALUES is supported".into()),
     };
 
-    Ok(SqlStatement::Insert(InsertStmt { table, columns, rows }))
+    Ok(SqlStatement::Insert(InsertStmt {
+        table,
+        columns,
+        rows,
+    }))
 }
 
 // ── UPDATE ─────────────────────────────────────────────────────────
@@ -407,16 +478,22 @@ fn convert_update(
         .map(|a| {
             let col = match &a.target {
                 AssignmentTarget::ColumnName(name) => object_name_to_string(name),
-                AssignmentTarget::Tuple(names) => {
-                    names.iter().map(object_name_to_string).collect::<Vec<_>>().join(".")
-                }
+                AssignmentTarget::Tuple(names) => names
+                    .iter()
+                    .map(object_name_to_string)
+                    .collect::<Vec<_>>()
+                    .join("."),
             };
             (col, expr_to_value(&a.value).unwrap_or_default())
         })
         .collect();
 
     let where_clause = selection.as_ref().map(convert_expr).transpose()?;
-    Ok(SqlStatement::Update(UpdateStmt { table: table_name, assignments: assigns, where_clause }))
+    Ok(SqlStatement::Update(UpdateStmt {
+        table: table_name,
+        assignments: assigns,
+        where_clause,
+    }))
 }
 
 // ── DELETE ──────────────────────────────────────────────────────────
@@ -428,7 +505,10 @@ fn convert_delete(delete: ast::Delete) -> Result<SqlStatement, String> {
     let first = tables_vec.first().ok_or("DELETE requires a FROM table")?;
     let table = convert_table_factor(&first.relation)?.table;
     let where_clause = delete.selection.as_ref().map(convert_expr).transpose()?;
-    Ok(SqlStatement::Delete(DeleteStmt { table, where_clause }))
+    Ok(SqlStatement::Delete(DeleteStmt {
+        table,
+        where_clause,
+    }))
 }
 
 // ── CREATE TABLE ───────────────────────────────────────────────────
@@ -440,7 +520,10 @@ fn convert_create_table(ct: ast::CreateTable) -> Result<SqlStatement, String> {
         columns.push(convert_column_def(col)?);
     }
     Ok(SqlStatement::CreateTable(CreateTableStmt {
-        table_def: TableDef { name: table, columns },
+        table_def: TableDef {
+            name: table,
+            columns,
+        },
         if_not_exists: ct.if_not_exists,
     }))
 }
@@ -457,14 +540,24 @@ fn convert_column_def(col: &SqlColumnDef) -> Result<ColumnDef, String> {
     for opt in &col.options {
         match &opt.option {
             ColumnOption::Unique { is_primary, .. } => {
-                if *is_primary { primary_key = true; not_null = true; } else { unique = true; }
+                if *is_primary {
+                    primary_key = true;
+                    not_null = true;
+                } else {
+                    unique = true;
+                }
             }
             ColumnOption::NotNull => not_null = true,
             ColumnOption::Default(expr) => {
                 default = expr_to_value(expr).map(|v| serde_json::Value::String(v));
             }
-            ColumnOption::ForeignKey { foreign_table, referred_columns, .. } => {
-                let ref_col = referred_columns.first()
+            ColumnOption::ForeignKey {
+                foreign_table,
+                referred_columns,
+                ..
+            } => {
+                let ref_col = referred_columns
+                    .first()
                     .map(|c| c.value.clone())
                     .unwrap_or_else(|| "id".to_string());
                 foreign_key = Some(ForeignKey {
@@ -476,19 +569,36 @@ fn convert_column_def(col: &SqlColumnDef) -> Result<ColumnDef, String> {
         }
     }
 
-    Ok(ColumnDef { name, col_type, primary_key, not_null, unique, default, foreign_key })
+    Ok(ColumnDef {
+        name,
+        col_type,
+        primary_key,
+        not_null,
+        unique,
+        default,
+        foreign_key,
+    })
 }
 
 fn convert_data_type(dt: &DataType) -> Result<ColumnType, String> {
     match dt {
-        DataType::Text | DataType::Varchar(_) | DataType::CharVarying(_)
-        | DataType::Char(_) | DataType::String(_) => Ok(ColumnType::Text),
+        DataType::Text
+        | DataType::Varchar(_)
+        | DataType::CharVarying(_)
+        | DataType::Char(_)
+        | DataType::String(_) => Ok(ColumnType::Text),
 
-        DataType::Integer(_) | DataType::Int(_) | DataType::BigInt(_)
-        | DataType::SmallInt(_) | DataType::TinyInt(_) => Ok(ColumnType::Integer),
+        DataType::Integer(_)
+        | DataType::Int(_)
+        | DataType::BigInt(_)
+        | DataType::SmallInt(_)
+        | DataType::TinyInt(_) => Ok(ColumnType::Integer),
 
-        DataType::Real | DataType::Float(_) | DataType::Double(_)
-        | DataType::DoublePrecision | DataType::Numeric(_)
+        DataType::Real
+        | DataType::Float(_)
+        | DataType::Double(_)
+        | DataType::DoublePrecision
+        | DataType::Numeric(_)
         | DataType::Decimal(_) => Ok(ColumnType::Real),
 
         DataType::Boolean => Ok(ColumnType::Boolean),
@@ -503,10 +613,19 @@ fn convert_drop(
     names: Vec<ObjectName>,
     if_exists: bool,
 ) -> Result<SqlStatement, String> {
-    let name = names.first().map(object_name_to_string).ok_or("DROP requires a name")?;
+    let name = names
+        .first()
+        .map(object_name_to_string)
+        .ok_or("DROP requires a name")?;
     match object_type {
-        ast::ObjectType::Table => Ok(SqlStatement::DropTable(DropTableStmt { table: name, if_exists })),
-        ast::ObjectType::Index => Ok(SqlStatement::DropIndex(DropIndexStmt { table: String::new(), name })),
+        ast::ObjectType::Table => Ok(SqlStatement::DropTable(DropTableStmt {
+            table: name,
+            if_exists,
+        })),
+        ast::ObjectType::Index => Ok(SqlStatement::DropIndex(DropIndexStmt {
+            table: String::new(),
+            name,
+        })),
         _ => Err("unsupported DROP object type".into()),
     }
 }
@@ -515,14 +634,25 @@ fn convert_drop(
 
 fn convert_create_index(ci: ast::CreateIndex) -> Result<SqlStatement, String> {
     let table = object_name_to_string(&ci.table_name);
-    let columns: Vec<String> = ci.columns.iter().filter_map(|c| expr_to_column_name(&c.expr)).collect();
-    Ok(SqlStatement::CreateIndex(CreateIndexStmt { table, columns }))
+    let columns: Vec<String> = ci
+        .columns
+        .iter()
+        .filter_map(|c| expr_to_column_name(&c.expr))
+        .collect();
+    Ok(SqlStatement::CreateIndex(CreateIndexStmt {
+        table,
+        columns,
+    }))
 }
 
 // ── Helpers ────────────────────────────────────────────────────────
 
 fn object_name_to_string(name: &ObjectName) -> String {
-    name.0.iter().filter_map(|p| p.as_ident().map(|i| i.value.clone())).collect::<Vec<_>>().join(".")
+    name.0
+        .iter()
+        .filter_map(|p| p.as_ident().map(|i| i.value.clone()))
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 fn expr_to_column_name(expr: &Expr) -> Option<String> {
@@ -552,9 +682,10 @@ fn expr_to_value(expr: &Expr) -> Option<String> {
             Value::Null => Some("null".to_string()),
             _ => None,
         },
-        Expr::UnaryOp { op: UnaryOperator::Minus, expr: inner } => {
-            expr_to_value(inner).map(|v| format!("-{v}"))
-        }
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr: inner,
+        } => expr_to_value(inner).map(|v| format!("-{v}")),
         _ => None,
     }
 }

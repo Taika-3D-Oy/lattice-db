@@ -25,7 +25,7 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::rc::Rc;
 
-use nats_wasi::client::{Client, Message, secs};
+use nats_wasi::client::{secs, Client, Message};
 use nats_wasi::jetstream::JetStream;
 
 use crate::state::{self, FieldFilter, SharedState};
@@ -296,7 +296,14 @@ struct ChangeEvent {
 // ── Dispatch ───────────────────────────────────────────────────────
 
 /// Handle an incoming request message. Replies via NATS to the reply-to subject.
-pub async fn handle(client: &Client, js: &JetStream, config: &SharedConfig, state: &SharedState, store: &SharedStore, msg: Message) {
+pub async fn handle(
+    client: &Client,
+    js: &JetStream,
+    config: &SharedConfig,
+    state: &SharedState,
+    store: &SharedStore,
+    msg: Message,
+) {
     let Some(reply_to) = msg.reply_to.as_deref() else {
         return; // no reply subject, nothing to respond to
     };
@@ -366,44 +373,77 @@ pub async fn handle(client: &Client, js: &JetStream, config: &SharedConfig, stat
 
 // ── Ensure table is loaded ─────────────────────────────────────────
 
-async fn ensure_loaded(table: &str, state: &SharedState, store: &SharedStore) -> Result<(), String> {
-    let needs_load = {
+async fn ensure_loaded(
+    table: &str,
+    state: &SharedState,
+    store: &SharedStore,
+) -> Result<(), String> {
+    // Two independent invariants must hold after this returns:
+    //   1. The table's data is loaded into the in-memory cache.
+    //   2. A background watcher is running so future writes from peer
+    //      replicas are reflected in this replica's cache.
+    // They are tracked separately because txn::recover() can pre-load tables
+    // before the dispatcher ever runs ensure_loaded — in that case `loaded`
+    // is already true but no watcher exists yet.
+    let (needs_load, needs_watcher) = {
         let s = state.borrow();
-        !s.tables.get(table).map_or(false, |t| t.loaded)
+        let t = s.tables.get(table);
+        (
+            !t.map_or(false, |t| t.loaded),
+            !t.map_or(false, |t| t.watching),
+        )
     };
-    if needs_load {
-        let kv = crate::store::get_or_create_kv(store, table)
+
+    if !needs_load && !needs_watcher {
+        return Ok(());
+    }
+
+    let kv = crate::store::get_or_create_kv(store, table)
+        .await
+        .map_err(|e| format!("load table: {e}"))?;
+
+    let max_rev = if needs_load {
+        let entries = kv
+            .load_all()
             .await
             .map_err(|e| format!("load table: {e}"))?;
-        let entries = kv.load_all().await.map_err(|e| format!("load table: {e}"))?;
-
-        // Find the highest revision we loaded so the watcher starts after it.
         let max_rev = entries.iter().map(|e| e.revision).max().unwrap_or(0);
-
         let mut s = state.borrow_mut();
         let ts = s.table(table);
         for entry in entries {
             ts.upsert(&entry.key, entry.value, entry.revision);
         }
         ts.loaded = true;
+        max_rev
+    } else {
+        // Already loaded — start the watcher from the highest revision we hold.
+        state
+            .borrow()
+            .tables
+            .get(table)
+            .map(|t| t.data.values().map(|r| r.revision).max().unwrap_or(0))
+            .unwrap_or(0)
+    };
 
-        // Spawn a background watcher if not already running.
-        if !ts.watching {
-            ts.watching = true;
-            let watch_state = state.clone();
-            let table_name = table.to_string();
-            let kv_clone = kv.clone();
-            wit_bindgen::spawn(async move {
-                run_table_watcher(kv_clone, &table_name, &watch_state, max_rev).await;
-            });
-        }
+    if needs_watcher {
+        state.borrow_mut().table(table).watching = true;
+        let watch_state = state.clone();
+        let table_name = table.to_string();
+        wit_bindgen::spawn(async move {
+            run_table_watcher(kv, &table_name, &watch_state, max_rev).await;
+        });
     }
     Ok(())
 }
 
 /// Background loop that watches a KV bucket for changes from other replicas
 /// and updates the local in-memory cache + indexes.
-async fn run_table_watcher(kv: nats_wasi::kv::KeyValue, table: &str, state: &SharedState, start_after: u64) {
+async fn run_table_watcher(
+    kv: nats_wasi::kv::KeyValue,
+    table: &str,
+    state: &SharedState,
+    start_after: u64,
+) {
     let watcher = match kv.watch(start_after).await {
         Ok(w) => w,
         Err(e) => {
@@ -428,7 +468,9 @@ async fn run_table_watcher(kv: nats_wasi::kv::KeyValue, table: &str, state: &Sha
         match entry.operation {
             nats_wasi::kv::Operation::Put => {
                 // Only apply if this is a newer revision than what we have.
-                let dominated = ts.data.get(&entry.key)
+                let dominated = ts
+                    .data
+                    .get(&entry.key)
                     .map_or(false, |r| r.revision >= entry.revision);
                 if !dominated {
                     ts.upsert(&entry.key, entry.value, entry.revision);
@@ -436,7 +478,9 @@ async fn run_table_watcher(kv: nats_wasi::kv::KeyValue, table: &str, state: &Sha
             }
             nats_wasi::kv::Operation::Delete | nats_wasi::kv::Operation::Purge => {
                 // Remove from cache. Check revision to avoid deleting a newer write.
-                let dominated = ts.data.get(&entry.key)
+                let dominated = ts
+                    .data
+                    .get(&entry.key)
                     .map_or(false, |r| r.revision > entry.revision);
                 if !dominated {
                     ts.remove(&entry.key);
@@ -446,9 +490,16 @@ async fn run_table_watcher(kv: nats_wasi::kv::KeyValue, table: &str, state: &Sha
             _ => {}
         }
     }
-    // If watcher disconnects, mark as not watching so it can be re-spawned.
-    state.borrow_mut().table(table).watching = false;
-    eprintln!("lattice-db: watcher stopped for table {table}");
+    // Watcher disconnected. Reset both flags so the next request to this
+    // table triggers a full reload from KV + fresh watcher. Without resetting
+    // `loaded`, the cache silently diverges and never re-syncs.
+    {
+        let mut s = state.borrow_mut();
+        let ts = s.table(table);
+        ts.watching = false;
+        ts.loaded = false;
+    }
+    eprintln!("lattice-db: watcher stopped for table {table} — will reload on next request");
 }
 
 // ── Operation handlers ─────────────────────────────────────────────
@@ -464,9 +515,6 @@ async fn handle_get(
     let s = state.borrow();
     let table = s.tables.get(&req.table).ok_or("table not loaded")?;
     let row = table.data.get(&req.key).ok_or("not found")?;
-    if row.is_expired() {
-        return Err("not found".into());
-    }
 
     ok_json(&RowResp {
         key: req.key,
@@ -499,23 +547,27 @@ async fn handle_put(
         .await
         .map_err(|e| format!("{e}"))?;
     let revision = match req.ttl_seconds {
-        Some(ttl) => kv.put_with_ttl(&req.key, &value, secs(ttl)).await.map_err(|e| format!("{e}"))?,
+        Some(ttl) => kv
+            .put_with_ttl(&req.key, &value, secs(ttl))
+            .await
+            .map_err(|e| format!("{e}"))?,
         None => kv.put(&req.key, &value).await.map_err(|e| format!("{e}"))?,
     };
 
-    // Update cache + apply in-memory TTL for fast-path reads.
-    {
-        let mut s = state.borrow_mut();
-        let ts = s.table(&req.table);
-        ts.upsert(&req.key, value, revision);
-        if let Some(ttl) = req.ttl_seconds {
-            if let Some(row) = ts.data.get_mut(&req.key) {
-                row.expires_at_ms = Some(state::clock_ms() + ttl * 1000);
-            }
-        }
-    }
+    state
+        .borrow_mut()
+        .table(&req.table)
+        .upsert(&req.key, value, revision);
 
-    publish_change(client, "put", &req.table, &req.key, Some(&req.value), Some(revision), partitioned);
+    publish_change(
+        client,
+        "put",
+        &req.table,
+        &req.key,
+        Some(&req.value),
+        Some(revision),
+        partitioned,
+    );
     ok_json(&RevisionResp { revision })
 }
 
@@ -537,7 +589,15 @@ async fn handle_delete(
     // Update cache.
     state.borrow_mut().table(&req.table).remove(&req.key);
 
-    publish_change(client, "delete", &req.table, &req.key, None, None, partitioned);
+    publish_change(
+        client,
+        "delete",
+        &req.table,
+        &req.key,
+        None,
+        None,
+        partitioned,
+    );
     ok_json(&EmptyResp {})
 }
 
@@ -564,23 +624,43 @@ async fn handle_cas(
     let kv = crate::store::get_or_create_kv(store, &req.table)
         .await
         .map_err(|e| format!("{e}"))?;
-    let revision = match req.ttl_seconds {
-        Some(ttl) => kv.update_with_ttl(&req.key, &value, req.revision, secs(ttl)).await.map_err(|e| format!("{e}"))?,
-        None => kv.update(&req.key, &value, req.revision).await.map_err(|e| format!("{e}"))?,
-    };
-
-    {
-        let mut s = state.borrow_mut();
-        let ts = s.table(&req.table);
-        ts.upsert(&req.key, value, revision);
-        if let Some(ttl) = req.ttl_seconds {
-            if let Some(row) = ts.data.get_mut(&req.key) {
-                row.expires_at_ms = Some(state::clock_ms() + ttl * 1000);
-            }
+    let result = match req.ttl_seconds {
+        Some(ttl) => {
+            kv.update_with_ttl(&req.key, &value, req.revision, secs(ttl))
+                .await
         }
-    }
+        None => kv.update(&req.key, &value, req.revision).await,
+    };
+    // On success, update the local cache. On failure, proactively re-fetch
+    // the winning value from NATS so the client's next retry sees the current
+    // revision immediately, without waiting for the KV watcher to deliver it.
+    let revision = match result {
+        Ok(r) => r,
+        Err(e) => {
+            if let Ok(Some(current)) = kv.get(&req.key).await {
+                state.borrow_mut().table(&req.table).upsert(
+                    &req.key,
+                    current.value,
+                    current.revision,
+                );
+            }
+            return Err(format!("{e}"));
+        }
+    };
+    state
+        .borrow_mut()
+        .table(&req.table)
+        .upsert(&req.key, value, revision);
 
-    publish_change(client, "cas", &req.table, &req.key, Some(&req.value), Some(revision), partitioned);
+    publish_change(
+        client,
+        "cas",
+        &req.table,
+        &req.key,
+        Some(&req.value),
+        Some(revision),
+        partitioned,
+    );
     ok_json(&RevisionResp { revision })
 }
 
@@ -608,22 +688,30 @@ async fn handle_create(
         .await
         .map_err(|e| format!("{e}"))?;
     let revision = match req.ttl_seconds {
-        Some(ttl) => kv.create_with_ttl(&req.key, &value, secs(ttl)).await.map_err(|e| format!("{e}"))?,
-        None => kv.create(&req.key, &value).await.map_err(|e| format!("{e}"))?,
+        Some(ttl) => kv
+            .create_with_ttl(&req.key, &value, secs(ttl))
+            .await
+            .map_err(|e| format!("{e}"))?,
+        None => kv
+            .create(&req.key, &value)
+            .await
+            .map_err(|e| format!("{e}"))?,
     };
 
-    {
-        let mut s = state.borrow_mut();
-        let ts = s.table(&req.table);
-        ts.upsert(&req.key, value, revision);
-        if let Some(ttl) = req.ttl_seconds {
-            if let Some(row) = ts.data.get_mut(&req.key) {
-                row.expires_at_ms = Some(state::clock_ms() + ttl * 1000);
-            }
-        }
-    }
+    state
+        .borrow_mut()
+        .table(&req.table)
+        .upsert(&req.key, value, revision);
 
-    publish_change(client, "create", &req.table, &req.key, Some(&req.value), Some(revision), partitioned);
+    publish_change(
+        client,
+        "create",
+        &req.table,
+        &req.key,
+        Some(&req.value),
+        Some(revision),
+        partitioned,
+    );
     ok_json(&RevisionResp { revision })
 }
 
@@ -637,9 +725,9 @@ async fn handle_exists(
 
     let exists = {
         let s = state.borrow();
-        s.tables.get(&req.table).map_or(false, |t| {
-            t.data.get(&req.key).map_or(false, |row| !row.is_expired())
-        })
+        s.tables
+            .get(&req.table)
+            .map_or(false, |t| t.data.contains_key(&req.key))
     };
 
     ok_json(&ExistsResp { exists })
@@ -655,12 +743,7 @@ async fn handle_keys(
 
     let s = state.borrow();
     let table = s.tables.get(&req.table);
-    let mut keys: Vec<String> = table.map_or_else(Vec::new, |t| {
-        t.data.iter()
-            .filter(|(_, row)| !row.is_expired())
-            .map(|(k, _)| k.clone())
-            .collect()
-    });
+    let mut keys: Vec<String> = table.map_or_else(Vec::new, |t| t.data.keys().cloned().collect());
     keys.sort();
 
     let page_size = 100usize;
@@ -698,27 +781,27 @@ async fn handle_scan(
     // Try index scan, fall back to full scan.
     let matching_keys = match state::index_scan(table, &req.filters) {
         Some(keys) => keys,
-        None => {
-            table
-                .data
-                .iter()
-                .filter(|(k, row)| {
-                    !row.is_expired()
-                        && req.key_prefix.as_ref().map_or(true, |pfx| k.starts_with(pfx.as_str()))
-                        && state::matches_filters(&row.value, &req.filters)
-                })
-                .map(|(k, _)| k.clone())
-                .collect()
-        }
+        None => table
+            .data
+            .iter()
+            .filter(|(k, row)| {
+                req.key_prefix
+                    .as_ref()
+                    .map_or(true, |pfx| k.starts_with(pfx.as_str()))
+                    && state::matches_filters(&row.value, &req.filters)
+            })
+            .map(|(k, _)| k.clone())
+            .collect(),
     };
 
-    // Post-filter by key_prefix for index-scanned keys + filter expired.
+    // Post-filter by key_prefix for index-scanned keys.
     let matching_keys: Vec<String> = matching_keys
         .into_iter()
         .filter(|k| {
-            let passes_prefix = req.key_prefix.as_ref().map_or(true, |pfx| k.starts_with(pfx.as_str()));
-            let not_expired = table.data.get(k).map_or(false, |row| !row.is_expired());
-            passes_prefix && not_expired
+            req.key_prefix
+                .as_ref()
+                .map_or(true, |pfx| k.starts_with(pfx.as_str()))
+                && table.data.contains_key(k.as_str())
         })
         .collect();
 
@@ -783,12 +866,12 @@ async fn handle_count(
         Some(table) => match state::index_scan(table, &req.filters) {
             Some(keys) => keys
                 .iter()
-                .filter(|k| table.data.get(*k).map_or(false, |r| !r.is_expired()))
+                .filter(|k| table.data.contains_key(k.as_str()))
                 .count() as u64,
             None => table
                 .data
                 .values()
-                .filter(|row| !row.is_expired() && state::matches_filters(&row.value, &req.filters))
+                .filter(|row| state::matches_filters(&row.value, &req.filters))
                 .count() as u64,
         },
     };
@@ -808,7 +891,10 @@ async fn handle_index_create(
         if fields.len() < 2 {
             return Err("compound index requires at least 2 fields".into());
         }
-        state.borrow_mut().table(&req.table).create_compound_index(fields);
+        state
+            .borrow_mut()
+            .table(&req.table)
+            .create_compound_index(fields);
         fields.join("+")
     } else if let Some(ref field) = req.field {
         state.borrow_mut().table(&req.table).create_index(field);
@@ -835,7 +921,9 @@ async fn handle_index_create(
         "fields": fields_list,
     });
     let index_bytes = serde_json::to_vec(&index_def).map_err(|e| format!("{e}"))?;
-    kv.put(&index_key, &index_bytes).await.map_err(|e| format!("{e}"))?;
+    kv.put(&index_key, &index_bytes)
+        .await
+        .map_err(|e| format!("{e}"))?;
 
     ok_json(&EmptyResp {})
 }
@@ -865,14 +953,11 @@ async fn handle_index_drop(
 fn handle_index_list(state: &SharedState, payload: &[u8]) -> Result<Vec<u8>, String> {
     let req: TableReq = parse_req(payload)?;
     let s = state.borrow();
-    let mut indexes: Vec<String> = s
-        .tables
-        .get(&req.table)
-        .map_or_else(Vec::new, |t| {
-            let mut v: Vec<String> = t.indexes.keys().cloned().collect();
-            v.extend(t.compound_indexes.keys().cloned());
-            v
-        });
+    let mut indexes: Vec<String> = s.tables.get(&req.table).map_or_else(Vec::new, |t| {
+        let mut v: Vec<String> = t.indexes.keys().cloned().collect();
+        v.extend(t.compound_indexes.keys().cloned());
+        v
+    });
     indexes.sort();
     ok_json(&IndexesResp { indexes })
 }
@@ -903,21 +988,19 @@ async fn handle_batch_get(
     let results: Vec<BatchGetResult> = req
         .keys
         .iter()
-        .map(|key| {
-            match table.and_then(|t| t.data.get(key)) {
-                Some(row) if !row.is_expired() => BatchGetResult {
-                    key: key.clone(),
-                    value: Some(B64.encode(&row.value)),
-                    revision: Some(row.revision),
-                    error: None,
-                },
-                _ => BatchGetResult {
-                    key: key.clone(),
-                    value: None,
-                    revision: None,
-                    error: Some("not found".into()),
-                },
-            }
+        .map(|key| match table.and_then(|t| t.data.get(key)) {
+            Some(row) => BatchGetResult {
+                key: key.clone(),
+                value: Some(B64.encode(&row.value)),
+                revision: Some(row.revision),
+                error: None,
+            },
+            _ => BatchGetResult {
+                key: key.clone(),
+                value: None,
+                revision: None,
+                error: Some("not found".into()),
+            },
         })
         .collect();
 
@@ -942,7 +1025,9 @@ async fn handle_batch_put(
         let s = state.borrow();
         if let Some(schema) = s.tables.get(&req.table).and_then(|t| t.schema.as_ref()) {
             for entry in &req.entries {
-                let value = B64.decode(&entry.value).map_err(|e| format!("base64 for {}: {e}", entry.key))?;
+                let value = B64
+                    .decode(&entry.value)
+                    .map_err(|e| format!("base64 for {}: {e}", entry.key))?;
                 state::validate_schema(&value, schema)?;
             }
         }
@@ -954,25 +1039,35 @@ async fn handle_batch_put(
 
     let mut results = Vec::with_capacity(req.entries.len());
     for entry in &req.entries {
-        let value = B64.decode(&entry.value).map_err(|e| format!("base64: {e}"))?;
+        let value = B64
+            .decode(&entry.value)
+            .map_err(|e| format!("base64: {e}"))?;
         validate_write_bounds(&req.table, &entry.key, &value)?;
         let revision = match entry.ttl_seconds {
-            Some(ttl) => kv.put_with_ttl(&entry.key, &value, secs(ttl)).await.map_err(|e| format!("{e}"))?,
-            None => kv.put(&entry.key, &value).await.map_err(|e| format!("{e}"))?,
+            Some(ttl) => kv
+                .put_with_ttl(&entry.key, &value, secs(ttl))
+                .await
+                .map_err(|e| format!("{e}"))?,
+            None => kv
+                .put(&entry.key, &value)
+                .await
+                .map_err(|e| format!("{e}"))?,
         };
 
-        {
-            let mut s = state.borrow_mut();
-            let ts = s.table(&req.table);
-            ts.upsert(&entry.key, value, revision);
-            if let Some(ttl) = entry.ttl_seconds {
-                if let Some(row) = ts.data.get_mut(&entry.key) {
-                    row.expires_at_ms = Some(state::clock_ms() + ttl * 1000);
-                }
-            }
-        }
+        state
+            .borrow_mut()
+            .table(&req.table)
+            .upsert(&entry.key, value, revision);
 
-        publish_change(client, "put", &req.table, &entry.key, Some(&entry.value), Some(revision), partitioned);
+        publish_change(
+            client,
+            "put",
+            &req.table,
+            &entry.key,
+            Some(&entry.value),
+            Some(revision),
+            partitioned,
+        );
         results.push(BatchPutResult {
             key: entry.key.clone(),
             revision,
@@ -1013,7 +1108,11 @@ async fn handle_aggregate(
 
 // ── Schema management ──────────────────────────────────────────────
 
-async fn handle_schema_set(state: &SharedState, store: &SharedStore, payload: &[u8]) -> Result<Vec<u8>, String> {
+async fn handle_schema_set(
+    state: &SharedState,
+    store: &SharedStore,
+    payload: &[u8],
+) -> Result<Vec<u8>, String> {
     let req: SchemaSetReq = parse_req(payload)?;
     if let Some(fields) = req.schema.get("fields") {
         if !fields.is_object() {
@@ -1024,7 +1123,9 @@ async fn handle_schema_set(state: &SharedState, store: &SharedStore, payload: &[
         .await
         .map_err(|e| format!("{e}"))?;
     let schema_bytes = serde_json::to_vec(&req.schema).map_err(|e| format!("{e}"))?;
-    kv.put(&req.table, &schema_bytes).await.map_err(|e| format!("{e}"))?;
+    kv.put(&req.table, &schema_bytes)
+        .await
+        .map_err(|e| format!("{e}"))?;
 
     state.borrow_mut().table(&req.table).schema = Some(req.schema);
     ok_json(&EmptyResp {})
@@ -1041,7 +1142,11 @@ fn handle_schema_get(state: &SharedState, payload: &[u8]) -> Result<Vec<u8>, Str
     ok_json(&SchemaResp { schema })
 }
 
-async fn handle_schema_delete(state: &SharedState, store: &SharedStore, payload: &[u8]) -> Result<Vec<u8>, String> {
+async fn handle_schema_delete(
+    state: &SharedState,
+    store: &SharedStore,
+    payload: &[u8],
+) -> Result<Vec<u8>, String> {
     let req: TableReq = parse_req(payload)?;
     let kv = crate::store::get_or_create_kv(store, "_schemas")
         .await
@@ -1125,7 +1230,9 @@ pub(crate) fn check_no_reserved_tables(op: &str, payload: &[u8]) -> Result<(), S
 /// S-04: validate key and decoded-value sizes before writing to NATS KV.
 pub(crate) fn validate_write_bounds(table: &str, key: &str, value: &[u8]) -> Result<(), String> {
     if table.len() > MAX_TABLE_LEN {
-        return Err(format!("table name exceeds maximum length of {MAX_TABLE_LEN}"));
+        return Err(format!(
+            "table name exceeds maximum length of {MAX_TABLE_LEN}"
+        ));
     }
     if key.len() > MAX_KEY_LEN {
         return Err(format!("key exceeds maximum length of {MAX_KEY_LEN}"));
@@ -1180,16 +1287,27 @@ fn apply_partition_prefix(payload: &[u8]) -> Result<Vec<u8>, String> {
     if partition.is_empty() || partition.len() > 64 {
         return Err("invalid partition ID".into());
     }
-    if !partition.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-') {
+    if !partition
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+    {
         return Err("invalid partition ID: only alphanumeric, _, - allowed".into());
     }
-    if let Some(table) = v.get("table").and_then(|t| t.as_str()).map(|t| t.to_string()) {
+    if let Some(table) = v
+        .get("table")
+        .and_then(|t| t.as_str())
+        .map(|t| t.to_string())
+    {
         v["table"] = serde_json::Value::String(format!("{partition}_{table}"));
     }
     // Also prefix table names inside transaction ops (ldb.txn).
     if let Some(ops) = v.get_mut("ops").and_then(|o| o.as_array_mut()) {
         for op in ops.iter_mut() {
-            if let Some(table) = op.get("table").and_then(|t| t.as_str()).map(|t| t.to_string()) {
+            if let Some(table) = op
+                .get("table")
+                .and_then(|t| t.as_str())
+                .map(|t| t.to_string())
+            {
                 op["table"] = serde_json::Value::String(format!("{partition}_{table}"));
             }
         }

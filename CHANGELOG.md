@@ -1,5 +1,85 @@
 # Changelog
 
+## [1.1.0] - 2026-04-22
+
+Focus: distributed correctness when scaling the storage-service workload up
+and down. None of the wire-protocol APIs changed.
+
+### Distributed Correctness Fixes
+
+#### Indexes survive reboots and propagate to new replicas
+- **Issue**: Index definitions were persisted to the `_indexes` KV bucket but
+  never reloaded on startup, so indexes were silently lost on restart and
+  invisible to scaled-up replicas. Queries silently degraded to full scans.
+- **Fix**: `main.rs` now loads `_indexes` at startup and rebuilds in-memory
+  index structures via `create_index` / `create_compound_index`. A KV watcher
+  keeps every replica in sync when an index is created or dropped on any peer.
+- **Files**: `storage-service/src/main.rs`
+
+#### TTL is uniformly visible across all replicas
+- **Issue**: Originating replica hid expired keys via a local monotonic clock,
+  but peers still served them until the NATS-side `Operation::Delete` arrived.
+  This created a window of stale-but-visible reads on peers.
+- **Fix**: Removed the local `expires_at_ms` / `clock_ms` / `reap_expired`
+  machinery entirely. Per-message TTL is enforced solely by the NATS server
+  (`Nats-TTL` header, `allow_msg_ttl: true`); KV watchers receive
+  `Operation::Delete` simultaneously on every replica, so expiry is uniform
+  by construction.
+- **Files**: `storage-service/src/state.rs`, `storage-service/src/handler.rs`,
+  `storage-service/src/main.rs`
+
+#### CAS retries see the winning revision immediately
+- **Issue**: On `cas` revision-mismatch, the client's next `get` could return
+  a stale cached row until the KV watcher delivered the conflicting write.
+- **Fix**: On any CAS failure, `handle_cas` proactively does `kv.get(&key)`
+  and refreshes the local cache so the client's next read returns the
+  authoritative current value/revision.
+- **Files**: `storage-service/src/handler.rs`
+
+#### Watchers survive NATS hiccups
+- **Issue**: Per-table KV watchers exited on disconnect with `watching = false`
+  but `loaded = true`. `ensure_loaded` therefore never re-spawned them, so the
+  cache silently diverged from peers until the replica restarted. The schema
+  and index watchers in `main.rs` similarly exited and never reconnected.
+- **Fix**:
+  - Per-table watcher now sets both `loaded = false` and `watching = false`
+    on disconnect so the next request triggers a full reload + fresh watcher.
+  - Schema and index watchers in `main.rs` wrapped in self-respawning loops
+    with 5s backoff that track the last-seen revision across reconnects.
+- **Files**: `storage-service/src/handler.rs`, `storage-service/src/main.rs`
+
+#### WAL recovery is cross-replica safe
+- **Issue**: A newly started replica could roll back PREPARE records that
+  belonged to a *live* peer's in-flight transaction, corrupting committed
+  state. The ad-hoc `purge_stream` could also race against in-flight COMMITs.
+- **Fix**:
+  - WAL records carry a per-process random `node_id`
+    (`wasi:random/get_random_u64`).
+  - Recovery skips PREPAREs younger than 30 s on **server-side timestamp**
+    (new in `nats-wasip3` 0.8.0's `StreamMessage.time`), unless the record
+    was authored by this very process.
+  - Per-txn recovery lock via `kv.create` on a new `ldb-_recovery-locks`
+    bucket (TTL 300 s); only the winning replica runs rollback, crashed
+    claimers free up after the lock TTL.
+  - Removed the ad-hoc `purge_stream` — relies on the existing
+    `max_msgs: 10_000` stream bound.
+- **Files**: `storage-service/src/txn.rs`, `storage-service/src/main.rs`
+
+#### Tables loaded by recovery now also get watchers
+- **Issue**: `txn::recover` pre-loaded tables before the dispatcher ran,
+  marking `loaded = true`. `handler::ensure_loaded` keyed watcher spawn off
+  `needs_load`, so those tables never got a KV watcher and missed all peer
+  writes.
+- **Fix**: `ensure_loaded` now tracks `loaded` and `watching` independently
+  and spawns a watcher whenever one is missing, even if data is already
+  cached.
+- **Files**: `storage-service/src/handler.rs`
+
+### Dependencies
+
+- Bumped `nats-wasip3` 0.7 → 0.8 across all four workspace crates for the
+  new `StreamMessage.time` field used by WAL recovery grace logic.
+
 ## [1.0.0] - 2024
 
 ### ✨ Major Features

@@ -10,7 +10,7 @@ mod store;
 mod tests;
 mod txn;
 
-use nats_wasi::client::{Client, ConnectConfig, secs};
+use nats_wasi::client::{Client, ConnectConfig};
 use nats_wasi::jetstream::JetStream;
 use std::rc::Rc;
 
@@ -30,8 +30,6 @@ impl wasip3::exports::cli::run::Guest for LatticeDb {
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize monotonic clock for TTL tracking.
-    state::init_clock();
     // NATS address: env var > argv > default.
     let nats_addr = std::env::var("NATS_URL")
         .ok()
@@ -82,6 +80,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // Set up WAL stream and recover incomplete transactions.
+    txn::init_node_id();
     txn::ensure_wal_stream(&js)
         .await
         .map_err(|e| format!("wal stream setup: {e}"))?;
@@ -106,37 +105,53 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 max_rev = entries.iter().map(|e| e.revision).max().unwrap_or(0);
             }
-            // Spawn schema watcher for cross-replica sync.
+            // Spawn schema watcher for cross-replica sync. Reconnects
+            // automatically on disconnect so a NATS hiccup doesn't silently
+            // stop schema propagation across replicas.
             let schema_state = shared_state.clone();
             let schema_kv_handle = kv.clone();
             wit_bindgen::spawn(async move {
-                let watcher = match schema_kv_handle.watch(max_rev).await {
-                    Ok(w) => w,
-                    Err(e) => {
-                        eprintln!("lattice-db: schema watcher setup failed: {e}");
-                        return;
-                    }
-                };
-                eprintln!("lattice-db: schema watcher started (after seq {max_rev})");
+                let mut since = max_rev;
                 loop {
-                    let entry = match watcher.next().await {
-                        Ok(e) => e,
+                    let watcher = match schema_kv_handle.watch(since).await {
+                        Ok(w) => w,
                         Err(e) => {
-                            eprintln!("lattice-db: schema watcher error: {e}");
-                            break;
+                            eprintln!("lattice-db: schema watcher setup failed: {e} — retrying");
+                            wasip3::clocks::monotonic_clock::wait_for(nats_wasi::client::secs(5))
+                                .await;
+                            continue;
                         }
                     };
-                    let table_name = entry.key;
-                    match entry.operation {
-                        nats_wasi::kv::Operation::Put => {
-                            if let Ok(schema) = serde_json::from_slice::<serde_json::Value>(&entry.value) {
-                                schema_state.borrow_mut().table(&table_name).schema = Some(schema);
-                                eprintln!("lattice-db: schema updated for {table_name} (rev {})", entry.revision);
+                    eprintln!("lattice-db: schema watcher started (after seq {since})");
+                    loop {
+                        let entry = match watcher.next().await {
+                            Ok(e) => e,
+                            Err(e) => {
+                                eprintln!(
+                                    "lattice-db: schema watcher disconnected: {e} — reconnecting"
+                                );
+                                break;
                             }
-                        }
-                        _ => {
-                            schema_state.borrow_mut().table(&table_name).schema = None;
-                            eprintln!("lattice-db: schema removed for {table_name}");
+                        };
+                        since = entry.revision;
+                        let table_name = entry.key.clone();
+                        match entry.operation {
+                            nats_wasi::kv::Operation::Put => {
+                                if let Ok(schema) =
+                                    serde_json::from_slice::<serde_json::Value>(&entry.value)
+                                {
+                                    schema_state.borrow_mut().table(&table_name).schema =
+                                        Some(schema);
+                                    eprintln!(
+                                        "lattice-db: schema updated for {table_name} (rev {})",
+                                        entry.revision
+                                    );
+                                }
+                            }
+                            _ => {
+                                schema_state.borrow_mut().table(&table_name).schema = None;
+                                eprintln!("lattice-db: schema removed for {table_name}");
+                            }
                         }
                     }
                 }
@@ -144,19 +159,125 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Background reaper for expired entries.
+    // Load persisted index definitions from KV and rebuild in-memory indexes.
+    // Without this, indexes are silently lost on reboot and never propagate
+    // to newly scaled-up replicas.
     {
-        let reaper_state = shared_state.clone();
-        wit_bindgen::spawn(async move {
-            loop {
-                // Sleep ~30s using P3 monotonic clock.
-                wasip3::clocks::monotonic_clock::wait_for(secs(30)).await;
-                let reaped = reaper_state.borrow_mut().reap_expired();
-                if reaped > 0 {
-                    eprintln!("lattice-db: reaped {reaped} expired entries");
+        let index_kv = store::get_or_create_kv(&shared_store, "_indexes").await;
+        if let Ok(kv) = index_kv {
+            let mut max_rev = 0u64;
+            if let Ok(entries) = kv.load_all().await {
+                let mut s = shared_state.borrow_mut();
+                for entry in &entries {
+                    let Ok(def) = serde_json::from_slice::<serde_json::Value>(&entry.value) else {
+                        continue;
+                    };
+                    let Some(table) = def.get("table").and_then(|v| v.as_str()) else {
+                        continue;
+                    };
+                    let fields: Vec<String> = def
+                        .get("fields")
+                        .and_then(|v| v.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|v| v.as_str().map(String::from))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if fields.is_empty() {
+                        continue;
+                    }
+                    let ts = s.table(table);
+                    if fields.len() == 1 {
+                        ts.create_index(&fields[0]);
+                    } else {
+                        ts.create_compound_index(&fields);
+                    }
+                    eprintln!("lattice-db: loaded index for {table}: {}", fields.join("+"));
                 }
+                max_rev = entries.iter().map(|e| e.revision).max().unwrap_or(0);
             }
-        });
+            // Spawn index watcher for cross-replica sync. Reconnects
+            // automatically on disconnect so a NATS hiccup doesn't silently
+            // stop index propagation to newly scaled-up replicas.
+            let index_state = shared_state.clone();
+            let index_kv_handle = kv.clone();
+            wit_bindgen::spawn(async move {
+                let mut since = max_rev;
+                loop {
+                    let watcher = match index_kv_handle.watch(since).await {
+                        Ok(w) => w,
+                        Err(e) => {
+                            eprintln!("lattice-db: index watcher setup failed: {e} — retrying");
+                            wasip3::clocks::monotonic_clock::wait_for(nats_wasi::client::secs(5))
+                                .await;
+                            continue;
+                        }
+                    };
+                    eprintln!("lattice-db: index watcher started (after seq {since})");
+                    loop {
+                        let entry = match watcher.next().await {
+                            Ok(e) => e,
+                            Err(e) => {
+                                eprintln!(
+                                    "lattice-db: index watcher disconnected: {e} — reconnecting"
+                                );
+                                break;
+                            }
+                        };
+                        since = entry.revision;
+                        match entry.operation {
+                            nats_wasi::kv::Operation::Put => {
+                                let Ok(def) =
+                                    serde_json::from_slice::<serde_json::Value>(&entry.value)
+                                else {
+                                    continue;
+                                };
+                                let Some(table) =
+                                    def.get("table").and_then(|v| v.as_str()).map(String::from)
+                                else {
+                                    continue;
+                                };
+                                let fields: Vec<String> = def
+                                    .get("fields")
+                                    .and_then(|v| v.as_array())
+                                    .map(|a| {
+                                        a.iter()
+                                            .filter_map(|v| v.as_str().map(String::from))
+                                            .collect()
+                                    })
+                                    .unwrap_or_default();
+                                if fields.is_empty() {
+                                    continue;
+                                }
+                                let mut s = index_state.borrow_mut();
+                                let ts = s.table(&table);
+                                if fields.len() == 1 {
+                                    ts.create_index(&fields[0]);
+                                } else {
+                                    ts.create_compound_index(&fields);
+                                }
+                                eprintln!(
+                                    "lattice-db: index updated for {table}: {} (rev {})",
+                                    fields.join("+"),
+                                    entry.revision
+                                );
+                            }
+                            _ => {
+                                // Key format: "{table}.{index_name}".
+                                if let Some((table, name)) = entry.key.split_once('.') {
+                                    let mut s = index_state.borrow_mut();
+                                    let ts = s.table(table);
+                                    ts.drop_index(name);
+                                    ts.drop_compound_index(name);
+                                    eprintln!("lattice-db: index removed for {table}: {name}");
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
     }
 
     // Subscribe to all lattice-db operations (queue group for scaling).

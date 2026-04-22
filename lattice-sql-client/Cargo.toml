@@ -1,6 +1,6 @@
 [package]
 name = "lattice-sql-client"
-version = "1.0.1"
+version = "1.1.0"
 edition = "2021"
 description = "Typed Rust client SDK for lattice-sql — SQL frontend for lattice-db"
 license = "Apache-2.0"
@@ -13,7 +13,7 @@ rust-version = "1.85"
 autobins = false
 
 [dependencies]
-nats-wasi = { package = "nats-wasip3", version = "0.7" }
+nats-wasi = { package = "nats-wasip3", version = "0.8" }
 wasip3 = "0.5"
 wit-bindgen = { version = "0.54", default-features = false, features = ["async", "async-spawn", "macros"] }
 serde = { version = "1", features = ["derive"] }

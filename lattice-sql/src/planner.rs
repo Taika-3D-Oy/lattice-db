@@ -180,7 +180,10 @@ fn plan_select(sel: SelectStmt, catalog: &Catalog) -> Result<Plan, String> {
     ensure_table_exists(table, catalog)?;
 
     let has_joins = !sel.joins.is_empty();
-    let has_aggregates = sel.columns.iter().any(|c| matches!(c, SelectColumn::Aggregate { .. }));
+    let has_aggregates = sel
+        .columns
+        .iter()
+        .any(|c| matches!(c, SelectColumn::Aggregate { .. }));
 
     if has_joins {
         return plan_join_select(sel, catalog);
@@ -253,7 +256,11 @@ fn plan_join_select(sel: SelectStmt, catalog: &Catalog) -> Result<Plan, String> 
     // Build left scan (just load all columns for now; projection happens after join).
     let left = TableScanPlan {
         table: base_table.clone(),
-        columns: base_def.column_names().iter().map(|s| s.to_string()).collect(),
+        columns: base_def
+            .column_names()
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
         filters: where_to_filters_for_table(&sel.where_clause, Some(base_alias))?,
         order_by: None,
         limit: None,
@@ -422,7 +429,9 @@ fn where_to_filters_for_table(
 
 fn collect_and_filters(expr: &WhereExpr) -> Result<Vec<PlanFilter>, String> {
     match expr {
-        WhereExpr::Comparison { field, op, value, .. } => {
+        WhereExpr::Comparison {
+            field, op, value, ..
+        } => {
             let op_str = match op {
                 CmpOp::Eq => "eq",
                 CmpOp::Neq => "neq",

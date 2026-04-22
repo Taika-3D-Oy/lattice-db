@@ -1,6 +1,5 @@
 /// Structured JSON logging module.
 /// Formats log messages as JSON to stderr for easy parsing and filtering.
-
 use std::fmt;
 
 #[derive(Debug)]
@@ -55,8 +54,7 @@ impl Log {
 
     /// Add a field to the log entry.
     pub fn field(mut self, key: impl Into<String>, value: impl fmt::Display) -> Self {
-        self.fields
-            .push((key.into(), value.to_string()));
+        self.fields.push((key.into(), value.to_string()));
         self
     }
 

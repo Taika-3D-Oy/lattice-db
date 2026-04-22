@@ -221,7 +221,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "lattice-db-client"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "base64",
  "nats-wasip3",
@@ -233,7 +233,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-sql"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "lattice-db-client",
  "nats-wasip3",
@@ -270,9 +270,9 @@ checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
 name = "nats-wasip3"
-version = "0.7.0"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba1c6180d291c441790ab6dd9ad8b000c08868704fa1fc95a3f919556cc48397"
+checksum = "25550ca48c1fa1b628c0ddbfc1ff4b27f30988b553aeb7037697789879af9bb7"
 dependencies = [
  "base64",
  "futures",
@@ -394,7 +394,7 @@ dependencies = [
 
 [[package]]
 name = "storage-service"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "base64",
  "futures",
