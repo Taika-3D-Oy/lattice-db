@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.2.1] - 2026-04-23
+
+### Fixes & cleanup
+
+- **`lattice-sql-client`**: `LatticeSql` struct was missing the `instance` field and the old `SUBJECT` const was still present, causing a compile error. Both fixed.
+- **`storage-service/src/tests.rs`**: Removed two obsolete partition tests (`test_partition_prefix_distinct`, `test_unpartitioned_vs_partitioned_config`) left over from the removed `_partition` scheme.
+- **`lattice-sql/src/planner.rs`**: Clarified a TODO comment from "filter partitioning" to "filter scoping for JOIN queries".
+- **`lattice-db-client/README.md`**: Updated quick-start snippet and auth section to use `with_instance` / `LDB_INSTANCE`; removed all `with_partition` / `LDB_PARTITIONED` references.
+
 ## [1.2.0] - 2026-04-23
 
 ### Breaking change — `LDB_PARTITIONED` and `_partition` removed

@@ -147,27 +147,6 @@ mod tests {
     }
 
     // ──────────────────────────────────────────────────────────────────
-    // Partition Prefix Tests
-    // ──────────────────────────────────────────────────────────────────
-
-    #[test]
-    fn test_partition_prefix_distinct() {
-        // Verify that partition IDs produce distinct prefixed table names
-        let p1_key = format!("p1_table");
-        let p2_key = format!("p2_table");
-        assert_ne!(p1_key, p2_key);
-    }
-
-    #[test]
-    fn test_unpartitioned_vs_partitioned_config() {
-        // Unpartitioned: partition ID should be empty
-        // Partitioned: partition ID should come from request
-        let unpartitioned = "";
-        let partitioned = "customer-a";
-        assert_ne!(unpartitioned, partitioned);
-    }
-
-    // ──────────────────────────────────────────────────────────────────
     // JSON Logging Tests
     // ──────────────────────────────────────────────────────────────────
 

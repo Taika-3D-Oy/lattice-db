@@ -27,10 +27,10 @@ use lattice_db_client::LatticeDb;
 
 let client = Client::connect(ConnectConfig::default()).await?;
 // Optional: auth token (required when server sets LDB_AUTH_TOKEN)
-//           partition (required when server sets LDB_PARTITIONED=1)
+//           instance  (must match LDB_INSTANCE on the server, default "ldb")
 let db = LatticeDb::new(client)
     .with_auth("my-secret-token")
-    .with_partition("acme");
+    .with_instance("acme");
 
 // Store and retrieve JSON
 db.put_json("users", "alice", &serde_json::json!({"name": "Alice"})).await?;
@@ -74,22 +74,22 @@ db.transaction(vec![
 | `set_schema` / `get_schema` / `delete_schema` | JSON schema validation |
 | `create_index` / `list_indexes` / `drop_index` | Secondary indexes |
 
-## Authentication & partitioning
+## Authentication & instance
 
 ```rust
 // Authenticate against a server with LDB_AUTH_TOKEN set:
 let db = LatticeDb::new(client).with_auth("my-secret-token");
 
-// Use a partition namespace on a server with LDB_PARTITIONED=1:
-let db = LatticeDb::new(client).with_partition("acme");
+// Connect to a non-default instance (must match LDB_INSTANCE on the server):
+let db = LatticeDb::new(client).with_instance("acme");
 
 // Both together:
 let db = LatticeDb::new(client)
     .with_auth("my-secret-token")
-    .with_partition("acme");
+    .with_instance("acme");
 ```
 
-Partitions are a logical key-namespace convenience, **not** a security boundary — any caller with the shared auth token can access any partition.
+The instance prefix defaults to `"ldb"`. All NATS subjects and KV bucket names are derived from it, so each lattice-db deployment on the same cluster stays fully isolated.
 
 ## Building
 

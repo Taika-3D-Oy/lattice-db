@@ -424,7 +424,7 @@ fn where_to_filters_for_table(
     let all = where_to_filters(expr)?;
     // If a table alias is specified, only include filters for that table.
     // Filters without a table qualifier are included for all tables.
-    Ok(all) // TODO: implement per-table filter partitioning
+    Ok(all) // TODO: implement per-table filter scoping for JOIN queries
 }
 
 fn collect_and_filters(expr: &WhereExpr) -> Result<Vec<PlanFilter>, String> {

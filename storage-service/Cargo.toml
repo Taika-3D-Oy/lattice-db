@@ -1,6 +1,6 @@
 [package]
 name = "storage-service"
-version = "1.2.0"
+version = "1.2.1"
 edition = "2021"
 description = "Self-contained distributed database service — connects to NATS, serves requests, persists to KV"
 license = "Apache-2.0"
