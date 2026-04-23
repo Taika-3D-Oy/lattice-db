@@ -1,7 +1,7 @@
 //! lattice-sql — SQL frontend for lattice-db.
 //!
 //! Connects to NATS, loads the SQL catalog from lattice-db, and serves
-//! SQL queries on `ldb.sql.>` subjects.
+//! SQL queries on `{instance}.sql.>` subjects.
 
 mod catalog;
 mod executor;
@@ -36,7 +36,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let use_tls = std::env::var("NATS_TLS").map_or(false, |v| v == "1" || v == "true");
 
-    eprintln!("lattice-sql: connecting to NATS at {nats_addr}");
+    // Instance name: must match the lattice-db storage-service deployment
+    // this SQL frontend is paired with.
+    let instance = std::env::var("LDB_INSTANCE").unwrap_or_else(|_| "ldb".to_string());
+
+    eprintln!("lattice-sql: connecting to NATS at {nats_addr} (instance={instance})");
 
     let client = Client::connect(ConnectConfig {
         address: nats_addr.to_string(),
@@ -53,7 +57,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Create lattice-db client (talks to storage-service over NATS).
-    let db = LatticeDb::new(client.clone());
+    let db = LatticeDb::new(client.clone()).with_instance(instance.clone());
 
     // Load SQL catalog from lattice-db.
     let catalog = catalog::Catalog::load(&db)
@@ -72,15 +76,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let shared_catalog = handler::new_shared_catalog(catalog);
 
     // Subscribe to SQL subjects (queue group for horizontal scaling).
-    let sub = client.subscribe_queue("ldb.sql.>", "ldb-sql-workers")?;
+    let sql_subject = format!("{instance}.sql.>");
+    let sql_queue = format!("{instance}-sql-workers");
+    let sub = client.subscribe_queue(&sql_subject, &sql_queue)?;
 
-    eprintln!("lattice-sql: listening on ldb.sql.> (queue group: ldb-sql-workers)");
+    eprintln!("lattice-sql: listening on {sql_subject} (queue group: {sql_queue})");
 
     loop {
         let msg = sub.next().await?;
 
         let client = client.clone();
-        let db_handle = LatticeDb::new(client.clone());
+        let db_handle = LatticeDb::new(client.clone()).with_instance(instance.clone());
         let cat = shared_catalog.clone();
         wit_bindgen::spawn(async move {
             handler::handle(&client, &db_handle, &cat, msg).await;

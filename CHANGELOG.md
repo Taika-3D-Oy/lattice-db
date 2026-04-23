@@ -1,5 +1,48 @@
 # Changelog
 
+## [1.2.0] - 2026-04-23
+
+### Breaking change — `LDB_PARTITIONED` and `_partition` removed
+
+The old per-request `_partition` field and `LDB_PARTITIONED=1` server flag have
+been replaced by a single **instance prefix** configured once at deploy time.
+
+**Before:**
+- One shared `storage-service` deployment, `LDB_PARTITIONED=1`
+- Every request payload carried `"_partition": "<id>"` to namespace its tables
+- KV buckets, WAL stream, and NATS subjects all shared the hardcoded `ldb-` prefix
+
+**After:**
+- One `storage-service` deployment per logical application, each with its own `LDB_INSTANCE=<id>`
+- No per-request field — callers send plain `{"table": "users", ...}` as always
+- Every NATS resource (subjects, KV buckets, WAL stream, queue group) is automatically scoped to the instance
+
+This trades a per-request runtime convention for a per-deployment configuration, giving
+full NATS-level isolation between apps sharing the same cluster. Each instance also gets
+its own 4 GiB Wasm memory budget, which was previously shared across all tenants.
+
+#### Migration
+
+| Before | After |
+|---|---|
+| `LDB_PARTITIONED=1` + `_partition: "orders"` on every call | `LDB_INSTANCE=orders` in the deployment env |
+| `nats sub "ldb-events.orders.users.>"` | `nats sub "orders-events.users.>"` |
+| `ldb-orders-users` KV bucket (with partition prefix in name) | `orders-users` KV bucket |
+
+`LDB_INSTANCE` defaults to `ldb` so **existing single-deployment setups work
+unchanged** without any env-var change.
+
+#### What changed
+
+- **`storage-service/src/main.rs`** — reads `LDB_INSTANCE` (validates: alphanumeric, `_`, `-`, max 64 chars); subscribes to `{instance}.>` with queue group `{instance}-workers`
+- **`storage-service/src/store.rs`** — `Store` carries the instance prefix; KV buckets named `{instance}-{table}`
+- **`storage-service/src/txn.rs`** — WAL stream `{instance}-txn`, WAL subject `_{instance}.txn.wal`, recovery-lock bucket `{instance}-_recovery-locks`; `ensure_wal_stream`, `recover`, `execute` all accept `instance: &str`
+- **`storage-service/src/handler.rs`** — `Config.partitioned: bool` → `Config.instance: String`; `apply_partition_prefix` removed; `publish_change` now emits `{instance}-events.{table}.{key}`
+- **`lattice-db-client/src/lib.rs`** — `with_partition()` removed; `with_instance()` added (default `"ldb"`); all NATS subjects derived from instance via `subj()` helper; `_partition` field no longer injected
+- **`lattice-sql/src/main.rs`** — reads `LDB_INSTANCE`; subscribes to `{instance}.sql.>`; passes instance to `LatticeDb` client
+- **`lattice-sql-client/src/lib.rs`** — `SUBJECT` const removed; `with_instance()` added; `subject()` method returns `{instance}.sql.query`
+- **`tests/integration_partitioned.sh`** — deleted (tested the removed `_partition` scheme)
+
 ## [1.1.0] - 2026-04-22
 
 Focus: distributed correctness when scaling the storage-service workload up

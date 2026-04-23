@@ -59,14 +59,28 @@ Every mutation also publishes a change event on `ldb-events.{table}.{key}`:
 nats sub "ldb-events.users.>"
 ```
 
-## Auth & multi-tenancy
+## Instance isolation
 
-Both opt-in, both shared-secret. **Not cryptographic isolation** — use NATS NKey/JWT or separate accounts for that.
+> **Note:** Throughout this README, `ldb` is the **default instance name** — the prefix used in all subject names, KV bucket names, and the WAL stream. It is not hardcoded; every occurrence of `ldb` in the examples above (`ldb.get`, `ldb-users`, `ldb-txn`, …) becomes your chosen name when you set `LDB_INSTANCE`.
+
+Deploy one `storage-service` per application. Set `LDB_INSTANCE` in each deployment's environment; all NATS subjects, KV buckets, and WAL resources are automatically namespaced.
 
 | Env var | Effect |
 |---|---|
+| `LDB_INSTANCE=instancename` | Subjects: `instancename.get`, `instancename.put`, … KV: `instancename-users`, `instancename-products`, … WAL: `instancename-txn` |
 | `LDB_AUTH_TOKEN=...` | Every request must include `"_auth": "<token>"` |
-| `LDB_PARTITIONED=1` | Every request must include `"_partition": "<id>"`; the id is prefixed onto the table name |
+
+`LDB_INSTANCE` defaults to `ldb`. Allowed characters: alphanumeric, `_`, `-`; max 64 chars.
+
+This is **NATS-level isolation** — an application using instance `asd` cannot accidentally read or write `wasd` data because the subjects are different. For stricter security (separate credentials), give each deployment its own NATS account or NKey.
+
+### Rust client
+
+```rust
+let db = LatticeDb::new(client)
+    .with_instance("instancename")   // must match LDB_INSTANCE on the server
+    .with_auth("secret");      // must match LDB_AUTH_TOKEN
+```
 
 ## Build & run
 
@@ -99,7 +113,6 @@ For a public-registry deployment, push `storage_service.wasm` to OCI and apply [
 ```bash
 bash tests/integration.sh             # 190 tests, plain local NATS
 bash tests/integration.sh --tls       # against the Kind cluster with mTLS
-bash tests/integration_partitioned.sh # 96 partition isolation tests (needs LDB_PARTITIONED=1)
 ```
 
 Requires `nats` CLI, `jq`, `base64`. See [TESTING.md](TESTING.md) for Kubernetes setup.
@@ -129,7 +142,7 @@ Tunables: `BENCH_DURATION_SECS` (10), `BENCH_CONCURRENCY` (64), `BENCH_TXN_CONCU
 ```
 storage-service/    # the database (wasm component)
   src/main.rs       #   NATS connection, queue subscription, watchers, WAL recovery
-  src/handler.rs    #   request dispatch for all ldb.* operations
+  src/handler.rs    #   request dispatch for all {instance}.* operations
   src/state.rs      #   in-memory cache, indexes, query engine, aggregation
   src/store.rs      #   NATS KV persistence
   src/txn.rs        #   WAL-backed transactions

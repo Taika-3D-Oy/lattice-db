@@ -1,7 +1,8 @@
 //! NATS KV wrapper — maps tables to KV buckets.
 //!
-//! Each table `foo` maps to NATS KV bucket `ldb-foo`. Buckets are created
-//! lazily on first access. The Store is now a simple bucket cache — all
+//! Each table `foo` maps to NATS KV bucket `{instance}-foo` where
+//! `instance` is the value of `LDB_INSTANCE` (default `ldb`). Buckets are
+//! created lazily on first access. The Store is a simple bucket cache — all
 //! async KV operations happen outside the RefCell borrow to avoid panics
 //! under concurrent tasks.
 
@@ -17,14 +18,19 @@ use nats_wasi::Error;
 /// Persistent store backed by NATS KV — bucket cache only.
 pub struct Store {
     js: JetStream,
+    /// Instance prefix (matches `LDB_INSTANCE`). All bucket names are
+    /// `{instance}-{table}` so multiple lattice-db deployments sharing the
+    /// same NATS cluster stay fully isolated.
+    pub instance: String,
     /// Open KV buckets, keyed by table name.
     buckets: HashMap<String, KeyValue>,
 }
 
 impl Store {
-    pub fn new(client: Client) -> Self {
+    pub fn new(client: Client, instance: String) -> Self {
         Self {
             js: JetStream::new(client),
+            instance,
             buckets: HashMap::new(),
         }
     }
@@ -48,8 +54,8 @@ impl Store {
 /// Shared store handle.
 pub type SharedStore = Rc<RefCell<Store>>;
 
-pub fn new_shared_store(client: Client) -> SharedStore {
-    Rc::new(RefCell::new(Store::new(client)))
+pub fn new_shared_store(client: Client, instance: String) -> SharedStore {
+    Rc::new(RefCell::new(Store::new(client, instance)))
 }
 
 /// Get or create a KV bucket handle without holding the store borrow during
@@ -61,7 +67,8 @@ pub async fn get_or_create_kv(store: &SharedStore, table: &str) -> Result<KeyVal
     }
     // Slow path: create bucket. Clone JS handle and release borrow first.
     let js = store.borrow().js();
-    let bucket_name = format!("ldb-{table}");
+    let instance = store.borrow().instance.clone();
+    let bucket_name = format!("{instance}-{table}");
     let kv = KeyValue::new(
         js,
         KvConfig {

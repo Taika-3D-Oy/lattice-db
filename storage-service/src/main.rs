@@ -61,31 +61,41 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         client.server_info().version,
     );
 
+    // Instance name: drives all NATS subject and KV bucket prefixes so that
+    // multiple lattice-db deployments sharing one NATS cluster stay isolated.
+    let instance = {
+        let raw = std::env::var("LDB_INSTANCE").unwrap_or_else(|_| "ldb".to_string());
+        if raw.is_empty() || raw.len() > 64 {
+            return Err("LDB_INSTANCE must be 1–64 characters".into());
+        }
+        if !raw.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-') {
+            return Err("LDB_INSTANCE may only contain alphanumeric characters, _ and -".into());
+        }
+        eprintln!("lattice-db: instance = {raw}");
+        raw
+    };
+
     let shared_state = state::new_shared_state();
-    let shared_store = store::new_shared_store(client.clone());
+    let shared_store = store::new_shared_store(client.clone(), instance.clone());
     let js = JetStream::new(client.clone());
 
-    // Auth / partitioning config.
+    // Auth config.
     let auth_token = std::env::var("LDB_AUTH_TOKEN").ok();
-    let partitioned = std::env::var("LDB_PARTITIONED").map_or(false, |v| v == "1" || v == "true");
     if auth_token.is_some() {
         eprintln!("lattice-db: auth token required (_auth field)");
     }
-    if partitioned {
-        eprintln!("lattice-db: partitioned mode enabled (_partition field required; logical namespace only, not a security boundary)");
-    }
     let config: handler::SharedConfig = Rc::new(handler::Config {
         auth_token,
-        partitioned,
+        instance: instance.clone(),
     });
 
     // Set up WAL stream and recover incomplete transactions.
     txn::init_node_id();
-    txn::ensure_wal_stream(&js)
+    txn::ensure_wal_stream(&js, &instance)
         .await
         .map_err(|e| format!("wal stream setup: {e}"))?;
 
-    let recovered = txn::recover(&js, &shared_state, &shared_store).await?;
+    let recovered = txn::recover(&js, &shared_state, &shared_store, &instance).await?;
     if recovered > 0 {
         eprintln!("lattice-db: recovered {recovered} incomplete transaction(s)");
     }
@@ -281,9 +291,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Subscribe to all lattice-db operations (queue group for scaling).
-    let sub = client.subscribe_queue("ldb.>", "ldb-workers")?;
+    let sub_subject = format!("{instance}.>");
+    let queue_group = format!("{instance}-workers");
+    let sub = client.subscribe_queue(&sub_subject, &queue_group)?;
 
-    eprintln!("lattice-db: listening on ldb.> (queue group: ldb-workers)");
+    eprintln!("lattice-db: listening on {sub_subject} (queue group: {queue_group})");
 
     loop {
         let msg = sub.next().await?;

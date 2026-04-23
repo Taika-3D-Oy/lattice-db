@@ -257,26 +257,22 @@ pub struct LatticeSql {
     timeout: Duration,
     /// Value sent as `_auth` on every request. Must match `LDB_AUTH_TOKEN`.
     auth_token: Option<String>,
+    /// NATS subject prefix. Must match `LDB_INSTANCE` on the server (default `ldb`).
+    instance: String,
 }
 
 impl LatticeSql {
-    /// NATS subject that lattice-sql subscribes to.
-    ///
-    /// The service accepts any subject matching `ldb.sql.>` and treats them
-    /// all identically. `ldb.sql.query` is used by convention.
-    pub const SUBJECT: &'static str = "ldb.sql.query";
-
     /// Create a new client with the default 10-second timeout.
     ///
     /// The timeout is higher than `LatticeDb`'s default (5s) because a single
     /// SQL query may require several round-trips to the storage service.
     pub fn new(client: Client) -> Self {
-        Self { client, timeout: secs(10), auth_token: None }
+        Self { client, timeout: secs(10), auth_token: None, instance: "ldb".to_string() }
     }
 
     /// Create a new client with a custom timeout (nanoseconds).
     pub fn with_timeout(client: Client, timeout: Duration) -> Self {
-        Self { client, timeout, auth_token: None }
+        Self { client, timeout, auth_token: None, instance: "ldb".to_string() }
     }
 
     /// Attach a shared auth token. Sent as `_auth` in every request.
@@ -285,6 +281,20 @@ impl LatticeSql {
     pub fn with_auth(mut self, token: impl Into<String>) -> Self {
         self.auth_token = Some(token.into());
         self
+    }
+
+    /// Set the instance prefix. Must match `LDB_INSTANCE` on the storage-service
+    /// and lattice-sql deployments this client is targeting.
+    ///
+    /// Defaults to `"ldb"`.
+    pub fn with_instance(mut self, instance: impl Into<String>) -> Self {
+        self.instance = instance.into();
+        self
+    }
+
+    /// Returns the NATS subject this client sends SQL requests to.
+    pub fn subject(&self) -> String {
+        format!("{}.sql.query", self.instance)
     }
 
     // ── Typed shortcuts ────────────────────────────────────────
@@ -347,9 +357,10 @@ impl LatticeSql {
         let body =
             serde_json::to_vec(&SqlReq { sql, auth: self.auth_token.as_deref() })
                 .map_err(|e| Error::Json(e.to_string()))?;
+        let subject = self.subject();
         let reply = self
             .client
-            .request(Self::SUBJECT, &body, self.timeout)
+            .request(&subject, &body, self.timeout)
             .await?;
         serde_json::from_slice(&reply.payload).map_err(|e| Error::Json(e.to_string()))
     }

@@ -35,10 +35,23 @@ use crate::store::SharedStore;
 
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
 
-const WAL_STREAM: &str = "ldb-txn";
-const WAL_SUBJECT: &str = "_ldb.txn.wal";
+const WAL_STREAM_SUFFIX: &str = "-txn";
+
+/// NATS JetStream stream name for the WAL of this instance.
+fn wal_stream(instance: &str) -> String {
+    format!("{instance}{WAL_STREAM_SUFFIX}")
+}
+
+/// NATS subject for WAL messages. Leading `_` keeps it out of `{instance}.>`
+/// subscriptions so WAL publishes are never dispatched as request handlers.
+fn wal_subject(instance: &str) -> String {
+    format!("_{instance}.txn.wal")
+}
+
 /// KV bucket used to coordinate which replica recovers a given txn id.
-const RECOVERY_LOCK_BUCKET: &str = "ldb-_recovery-locks";
+fn recovery_lock_bucket(instance: &str) -> String {
+    format!("{instance}-_recovery-locks")
+}
 /// PREPARE records younger than this are considered possibly-in-flight on a
 /// peer and are NOT rolled back by another replica's recovery scan.
 const RECOVERY_GRACE_SECS: i64 = 30;
@@ -145,10 +158,10 @@ struct WalOp {
 // ── WAL stream setup ───────────────────────────────────────────────
 
 /// Ensure the WAL stream exists. Called on startup.
-pub async fn ensure_wal_stream(js: &JetStream) -> Result<(), nats_wasi::Error> {
+pub async fn ensure_wal_stream(js: &JetStream, instance: &str) -> Result<(), nats_wasi::Error> {
     let config = StreamConfig {
-        name: WAL_STREAM.to_string(),
-        subjects: vec![WAL_SUBJECT.to_string()],
+        name: wal_stream(instance),
+        subjects: vec![wal_subject(instance)],
         retention: nats_wasi::jetstream::Retention::Limits,
         max_consumers: -1,
         max_msgs: 10_000,
@@ -178,6 +191,7 @@ pub async fn execute(
     state: &SharedState,
     store: &SharedStore,
     req: TxnRequest,
+    instance: &str,
 ) -> Result<TxnResponse, String> {
     if req.ops.is_empty() {
         return Err("transaction has no operations".into());
@@ -235,7 +249,7 @@ pub async fn execute(
         node_id: node_id(),
     };
     let wal_bytes = serde_json::to_vec(&wal).map_err(|e| format!("wal serialize: {e}"))?;
-    js.publish(WAL_SUBJECT, &wal_bytes)
+    js.publish(&wal_subject(instance), &wal_bytes)
         .await
         .map_err(|e| format!("wal write: {e}"))?;
 
@@ -267,7 +281,7 @@ pub async fn execute(
                 };
                 let abort_bytes =
                     serde_json::to_vec(&abort).map_err(|e2| format!("wal abort: {e2}"))?;
-                let _ = js.publish(WAL_SUBJECT, &abort_bytes).await;
+                let _ = js.publish(&wal_subject(instance), &abort_bytes).await;
 
                 let mut msg = format!(
                     "txn failed at op {i} ({} {}/{}): {e}",
@@ -292,7 +306,7 @@ pub async fn execute(
         node_id: node_id(),
     };
     let commit_bytes = serde_json::to_vec(&commit).map_err(|e| format!("wal commit: {e}"))?;
-    js.publish(WAL_SUBJECT, &commit_bytes)
+    js.publish(&wal_subject(instance), &commit_bytes)
         .await
         .map_err(|e| format!("wal commit write: {e}"))?;
 
@@ -305,11 +319,11 @@ pub async fn execute(
 ///
 /// Bucket-wide TTL ensures that a replica which crashes mid-rollback does not
 /// block recovery forever — stale locks expire and another replica can claim.
-async fn open_recovery_lock_bucket(js: &JetStream) -> Result<KeyValue, nats_wasi::Error> {
+async fn open_recovery_lock_bucket(js: &JetStream, instance: &str) -> Result<KeyValue, nats_wasi::Error> {
     KeyValue::new(
         js.clone(),
         KvConfig {
-            bucket: RECOVERY_LOCK_BUCKET.to_string(),
+            bucket: recovery_lock_bucket(instance),
             history: 1,
             ttl: Some(secs(RECOVERY_LOCK_TTL_SECS)),
             ..Default::default()
@@ -375,9 +389,10 @@ pub async fn recover(
     js: &JetStream,
     state: &SharedState,
     store: &SharedStore,
+    instance: &str,
 ) -> Result<u32, String> {
     // Get stream info to know the sequence range.
-    let info = match js.stream_info(WAL_STREAM).await {
+    let info = match js.stream_info(&wal_stream(instance)).await {
         Ok(info) => info,
         Err(nats_wasi::Error::JetStream { code: 404, .. }) => return Ok(0),
         Err(e) => return Err(format!("wal stream info: {e}")),
@@ -390,7 +405,7 @@ pub async fn recover(
     // Open the recovery-lock bucket up front. If we can't, skip recovery
     // entirely — better to leave PREPAREs in place for another replica than
     // race without coordination.
-    let lock_kv = match open_recovery_lock_bucket(js).await {
+    let lock_kv = match open_recovery_lock_bucket(js, instance).await {
         Ok(kv) => kv,
         Err(e) => {
             eprintln!("lattice-db: recovery lock bucket setup failed: {e} — skipping recovery");
@@ -413,7 +428,7 @@ pub async fn recover(
     let last = info.state.last_seq;
 
     for seq in first..=last {
-        let msg = match js.stream_get_msg(WAL_STREAM, seq).await {
+        let msg = match js.stream_get_msg(&wal_stream(instance), seq).await {
             Ok(Some(m)) => m,
             Ok(None) => continue,
             Err(e) => {
@@ -508,7 +523,7 @@ pub async fn recover(
             node_id: own_node,
         };
         let abort_bytes = serde_json::to_vec(&abort).unwrap_or_default();
-        let _ = js.publish(WAL_SUBJECT, &abort_bytes).await;
+        let _ = js.publish(&wal_subject(instance), &abort_bytes).await;
 
         recovered += 1;
     }

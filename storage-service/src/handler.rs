@@ -53,11 +53,11 @@ const MAX_BATCH_SIZE: usize = 256;
 
 pub struct Config {
     pub auth_token: Option<String>,
-    /// Partitioned mode: each request must include a `_partition` field whose
-    /// value is prefixed onto the table name. NOTE: partitions are a logical
-    /// key-namespace convenience, NOT a security boundary. Any caller with
-    /// the shared auth token can read any partition by changing `_partition`.
-    pub partitioned: bool,
+    /// NATS subject prefix for this instance (matches `LDB_INSTANCE`).
+    /// Requests arrive on `{instance}.{op}`, KV buckets are named
+    /// `{instance}-{table}`, and change events are published to
+    /// `{instance}-events.{table}.{key}`.
+    pub instance: String,
 }
 
 pub type SharedConfig = Rc<Config>;
@@ -318,34 +318,23 @@ pub async fn handle(
     }
 
     // S-01: reject reserved (_-prefixed) table names before any prefix transformation.
-    let op = msg.subject.strip_prefix("ldb.").unwrap_or(&msg.subject);
+    let prefix = format!("{instance}.", instance = config.instance);
+    let op = msg.subject.strip_prefix(&prefix).unwrap_or(&msg.subject);
     if let Err(e) = check_no_reserved_tables(op, &msg.payload) {
         let resp = serde_json::to_vec(&ErrorResp { error: e }).unwrap_or_default();
         let _ = client.publish(reply_to, &resp);
         return;
     }
 
-    // Partition prefix: rewrite table name in payload if partitioned mode is on.
-    let payload = if config.partitioned {
-        match apply_partition_prefix(&msg.payload) {
-            Ok(p) => p,
-            Err(e) => {
-                let resp = serde_json::to_vec(&ErrorResp { error: e }).unwrap_or_default();
-                let _ = client.publish(reply_to, &resp);
-                return;
-            }
-        }
-    } else {
-        msg.payload
-    };
+    let payload = msg.payload;
 
-    let partitioned = config.partitioned;
+    let instance = config.instance.as_str();
     let result = match op {
         "get" => handle_get(state, store, &payload).await,
-        "put" => handle_put(client, state, store, &payload, partitioned).await,
-        "delete" => handle_delete(client, state, store, &payload, partitioned).await,
-        "cas" => handle_cas(client, state, store, &payload, partitioned).await,
-        "create" => handle_create(client, state, store, &payload, partitioned).await,
+        "put" => handle_put(client, state, store, &payload, instance).await,
+        "delete" => handle_delete(client, state, store, &payload, instance).await,
+        "cas" => handle_cas(client, state, store, &payload, instance).await,
+        "create" => handle_create(client, state, store, &payload, instance).await,
         "exists" => handle_exists(state, store, &payload).await,
         "keys" => handle_keys(state, store, &payload).await,
         "scan" => handle_scan(state, store, &payload).await,
@@ -353,9 +342,9 @@ pub async fn handle(
         "index.create" => handle_index_create(state, store, &payload).await,
         "index.drop" => handle_index_drop(state, store, &payload).await,
         "index.list" => handle_index_list(state, &payload),
-        "txn" => handle_txn(js, state, store, &payload).await,
+        "txn" => handle_txn(js, state, store, &payload, instance).await,
         "batch.get" => handle_batch_get(state, store, &payload).await,
-        "batch.put" => handle_batch_put(client, state, store, &payload, partitioned).await,
+        "batch.put" => handle_batch_put(client, state, store, &payload, instance).await,
         "aggregate" => handle_aggregate(state, store, &payload).await,
         "schema.set" => handle_schema_set(state, store, &payload).await,
         "schema.get" => handle_schema_get(state, &payload),
@@ -528,7 +517,7 @@ async fn handle_put(
     state: &SharedState,
     store: &SharedStore,
     payload: &[u8],
-    partitioned: bool,
+    instance: &str,
 ) -> Result<Vec<u8>, String> {
     let req: PutReq = parse_req(payload)?;
     let value = B64.decode(&req.value).map_err(|e| format!("base64: {e}"))?;
@@ -566,7 +555,7 @@ async fn handle_put(
         &req.key,
         Some(&req.value),
         Some(revision),
-        partitioned,
+        instance,
     );
     ok_json(&RevisionResp { revision })
 }
@@ -576,7 +565,7 @@ async fn handle_delete(
     state: &SharedState,
     store: &SharedStore,
     payload: &[u8],
-    partitioned: bool,
+    instance: &str,
 ) -> Result<Vec<u8>, String> {
     let req: KeyReq = parse_req(payload)?;
     ensure_loaded(&req.table, state, store).await?;
@@ -596,7 +585,7 @@ async fn handle_delete(
         &req.key,
         None,
         None,
-        partitioned,
+        instance,
     );
     ok_json(&EmptyResp {})
 }
@@ -606,7 +595,7 @@ async fn handle_cas(
     state: &SharedState,
     store: &SharedStore,
     payload: &[u8],
-    partitioned: bool,
+    instance: &str,
 ) -> Result<Vec<u8>, String> {
     let req: CasReq = parse_req(payload)?;
     let value = B64.decode(&req.value).map_err(|e| format!("base64: {e}"))?;
@@ -659,7 +648,7 @@ async fn handle_cas(
         &req.key,
         Some(&req.value),
         Some(revision),
-        partitioned,
+        instance,
     );
     ok_json(&RevisionResp { revision })
 }
@@ -669,7 +658,7 @@ async fn handle_create(
     state: &SharedState,
     store: &SharedStore,
     payload: &[u8],
-    partitioned: bool,
+    instance: &str,
 ) -> Result<Vec<u8>, String> {
     let req: PutReq = parse_req(payload)?;
     let value = B64.decode(&req.value).map_err(|e| format!("base64: {e}"))?;
@@ -710,7 +699,7 @@ async fn handle_create(
         &req.key,
         Some(&req.value),
         Some(revision),
-        partitioned,
+        instance,
     );
     ok_json(&RevisionResp { revision })
 }
@@ -967,9 +956,10 @@ async fn handle_txn(
     state: &SharedState,
     store: &SharedStore,
     payload: &[u8],
+    instance: &str,
 ) -> Result<Vec<u8>, String> {
     let req: txn::TxnRequest = parse_req(payload)?;
-    let resp = txn::execute(js, state, store, req).await?;
+    let resp = txn::execute(js, state, store, req, instance).await?;
     ok_json(&resp)
 }
 
@@ -1012,7 +1002,7 @@ async fn handle_batch_put(
     state: &SharedState,
     store: &SharedStore,
     payload: &[u8],
-    partitioned: bool,
+    instance: &str,
 ) -> Result<Vec<u8>, String> {
     let req: BatchPutReq = parse_req(payload)?;
     if req.entries.len() > MAX_BATCH_SIZE {
@@ -1066,7 +1056,7 @@ async fn handle_batch_put(
             &entry.key,
             Some(&entry.value),
             Some(revision),
-            partitioned,
+            instance,
         );
         results.push(BatchPutResult {
             key: entry.key.clone(),
@@ -1175,7 +1165,7 @@ fn publish_change(
     key: &str,
     value: Option<&str>,
     revision: Option<u64>,
-    partitioned: bool,
+    instance: &str,
 ) {
     let event = ChangeEvent {
         op: op.to_string(),
@@ -1185,18 +1175,9 @@ fn publish_change(
         revision,
     };
     if let Ok(bytes) = serde_json::to_vec(&event) {
-        // S-02: in partitioned mode, namespace the subject under the partition
-        // so subscribers can scope to `ldb-events.{partition}.>` without
-        // seeing events from other partitions.
-        let subject = if partitioned {
-            if let Some((partition, base_table)) = table.split_once('_') {
-                format!("ldb-events.{partition}.{base_table}.{key}")
-            } else {
-                format!("ldb-events.{table}.{key}")
-            }
-        } else {
-            format!("ldb-events.{table}.{key}")
-        };
+        // Subscribers can scope to `{instance}-events.{table}.>` to receive
+        // only events from this instance.
+        let subject = format!("{instance}-events.{table}.{key}");
         let _ = client.publish(&subject, &bytes);
     }
 }
@@ -1271,46 +1252,4 @@ pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     acc == 0
 }
 
-/// Apply partition prefix to the table name in the payload.
-///
-/// Partitions are a logical key-namespace convenience. They are NOT a security
-/// boundary — any caller authenticated by the shared `LDB_AUTH_TOKEN` can read
-/// or write any partition by changing the `_partition` field.
-fn apply_partition_prefix(payload: &[u8]) -> Result<Vec<u8>, String> {
-    let mut v: serde_json::Value =
-        serde_json::from_slice(payload).map_err(|e| format!("invalid request: {e}"))?;
-    let partition = v
-        .get("_partition")
-        .and_then(|v| v.as_str())
-        .ok_or("_partition field required in partitioned mode")?
-        .to_string();
-    if partition.is_empty() || partition.len() > 64 {
-        return Err("invalid partition ID".into());
-    }
-    if !partition
-        .chars()
-        .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
-    {
-        return Err("invalid partition ID: only alphanumeric, _, - allowed".into());
-    }
-    if let Some(table) = v
-        .get("table")
-        .and_then(|t| t.as_str())
-        .map(|t| t.to_string())
-    {
-        v["table"] = serde_json::Value::String(format!("{partition}_{table}"));
-    }
-    // Also prefix table names inside transaction ops (ldb.txn).
-    if let Some(ops) = v.get_mut("ops").and_then(|o| o.as_array_mut()) {
-        for op in ops.iter_mut() {
-            if let Some(table) = op
-                .get("table")
-                .and_then(|t| t.as_str())
-                .map(|t| t.to_string())
-            {
-                op["table"] = serde_json::Value::String(format!("{partition}_{table}"));
-            }
-        }
-    }
-    serde_json::to_vec(&v).map_err(|e| format!("serialize: {e}"))
-}
+

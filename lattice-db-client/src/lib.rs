@@ -18,7 +18,7 @@
 //! let client = Client::connect(ConnectConfig::default()).await?;
 //! let db = LatticeDb::new(client)
 //!     .with_auth("my-token")          // matches LDB_AUTH_TOKEN on the server
-//!     .with_partition("acme");         // matches LDB_PARTITIONED=1 on the server
+//!     .with_instance("acme");          // matches LDB_INSTANCE=acme on the server
 //!
 //! // Store and retrieve JSON
 //! db.put_json("users", "alice", &serde_json::json!({"name": "Alice", "age": 30})).await?;
@@ -388,25 +388,25 @@ struct SchemaSetReqW<'a> { table: &'a str, schema: &'a serde_json::Value }
 // ── Client ─────────────────────────────────────────────────────────
 
 /// Typed client for lattice-db. Wraps a NATS client and forwards
-/// requests to the `ldb.>` subject tree.
+/// requests to the `{instance}.>` subject tree.
 pub struct LatticeDb {
     client: Client,
     timeout: Duration,
     /// Value sent as `_auth` on every request. Must match `LDB_AUTH_TOKEN`.
     auth_token: Option<String>,
-    /// Value sent as `_partition` on every request. Requires `LDB_PARTITIONED=1`.
-    partition: Option<String>,
+    /// NATS subject prefix. Must match `LDB_INSTANCE` on the server (default `ldb`).
+    instance: String,
 }
 
 impl LatticeDb {
     /// Create a new client with the default 5-second timeout.
     pub fn new(client: Client) -> Self {
-        Self { client, timeout: secs(5), auth_token: None, partition: None }
+        Self { client, timeout: secs(5), auth_token: None, instance: "ldb".to_string() }
     }
 
     /// Create a new client with a custom timeout (nanoseconds).
     pub fn with_timeout(client: Client, timeout: Duration) -> Self {
-        Self { client, timeout, auth_token: None, partition: None }
+        Self { client, timeout, auth_token: None, instance: "ldb".to_string() }
     }
 
     /// Attach a shared auth token. Sent as `_auth` in every request.
@@ -417,13 +417,12 @@ impl LatticeDb {
         self
     }
 
-    /// Attach a partition ID. Sent as `_partition` in every request.
+    /// Set the instance prefix. Must match `LDB_INSTANCE` on the server.
     ///
-    /// Required when the server is configured with `LDB_PARTITIONED=1`.
-    /// Partitions are a logical key-namespace convenience, **not** a security
-    /// boundary — any caller with the shared auth token can read any partition.
-    pub fn with_partition(mut self, id: impl Into<String>) -> Self {
-        self.partition = Some(id.into());
+    /// Defaults to `"ldb"`. Change this when connecting to a non-default
+    /// lattice-db deployment (e.g., one started with `LDB_INSTANCE=orders`).
+    pub fn with_instance(mut self, instance: impl Into<String>) -> Self {
+        self.instance = instance.into();
         self
     }
 
@@ -431,7 +430,7 @@ impl LatticeDb {
 
     /// Get a row by key. Returns raw bytes.
     pub async fn get(&self, table: &str, key: &str) -> Result<Row, Error> {
-        let resp: RowR = self.req("ldb.get", &KeyReq { table, key }).await?;
+        let resp: RowR = self.req(&self.subj("get"), &KeyReq { table, key }).await?;
         Ok(Row {
             key: resp.key,
             value: B64.decode(&resp.value).map_err(|e| Error::Base64(e.to_string()))?,
@@ -447,7 +446,7 @@ impl LatticeDb {
 
     /// Put a raw byte value. Returns the new revision.
     pub async fn put(&self, table: &str, key: &str, value: &[u8]) -> Result<u64, Error> {
-        let resp: RevisionR = self.req("ldb.put", &PutReq {
+        let resp: RevisionR = self.req(&self.subj("put"), &PutReq {
             table, key, value: B64.encode(value), ttl_seconds: None,
         }).await?;
         Ok(resp.revision)
@@ -455,7 +454,7 @@ impl LatticeDb {
 
     /// Put a raw byte value with a TTL. Returns the new revision.
     pub async fn put_with_ttl(&self, table: &str, key: &str, value: &[u8], ttl_seconds: u64) -> Result<u64, Error> {
-        let resp: RevisionR = self.req("ldb.put", &PutReq {
+        let resp: RevisionR = self.req(&self.subj("put"), &PutReq {
             table, key, value: B64.encode(value), ttl_seconds: Some(ttl_seconds),
         }).await?;
         Ok(resp.revision)
@@ -469,13 +468,13 @@ impl LatticeDb {
 
     /// Delete a key.
     pub async fn delete(&self, table: &str, key: &str) -> Result<(), Error> {
-        let _: serde_json::Value = self.req("ldb.delete", &KeyReq { table, key }).await?;
+        let _: serde_json::Value = self.req(&self.subj("delete"), &KeyReq { table, key }).await?;
         Ok(())
     }
 
     /// Create a key (fails if it already exists). Returns the revision.
     pub async fn create(&self, table: &str, key: &str, value: &[u8]) -> Result<u64, Error> {
-        let resp: RevisionR = self.req("ldb.create", &PutReq {
+        let resp: RevisionR = self.req(&self.subj("create"), &PutReq {
             table, key, value: B64.encode(value), ttl_seconds: None,
         }).await?;
         Ok(resp.revision)
@@ -483,7 +482,7 @@ impl LatticeDb {
 
     /// Create a key with an expiry (fails if it already exists). Returns the revision.
     pub async fn create_with_ttl(&self, table: &str, key: &str, value: &[u8], ttl_seconds: u64) -> Result<u64, Error> {
-        let resp: RevisionR = self.req("ldb.create", &PutReq {
+        let resp: RevisionR = self.req(&self.subj("create"), &PutReq {
             table, key, value: B64.encode(value), ttl_seconds: Some(ttl_seconds),
         }).await?;
         Ok(resp.revision)
@@ -497,7 +496,7 @@ impl LatticeDb {
 
     /// Compare-and-swap: update only if the current revision matches.
     pub async fn cas(&self, table: &str, key: &str, value: &[u8], revision: u64) -> Result<u64, Error> {
-        let resp: RevisionR = self.req("ldb.cas", &CasReq {
+        let resp: RevisionR = self.req(&self.subj("cas"), &CasReq {
             table, key, value: B64.encode(value), revision, ttl_seconds: None,
         }).await?;
         Ok(resp.revision)
@@ -506,7 +505,7 @@ impl LatticeDb {
     /// Compare-and-swap with an expiry. Only updates if revision matches;  
     /// the new value expires after `ttl_seconds`.
     pub async fn cas_with_ttl(&self, table: &str, key: &str, value: &[u8], revision: u64, ttl_seconds: u64) -> Result<u64, Error> {
-        let resp: RevisionR = self.req("ldb.cas", &CasReq {
+        let resp: RevisionR = self.req(&self.subj("cas"), &CasReq {
             table, key, value: B64.encode(value), revision, ttl_seconds: Some(ttl_seconds),
         }).await?;
         Ok(resp.revision)
@@ -514,7 +513,7 @@ impl LatticeDb {
 
     /// Check if a key exists.
     pub async fn exists(&self, table: &str, key: &str) -> Result<bool, Error> {
-        let resp: ExistsR = self.req("ldb.exists", &KeyReq { table, key }).await?;
+        let resp: ExistsR = self.req(&self.subj("exists"), &KeyReq { table, key }).await?;
         Ok(resp.exists)
     }
 
@@ -537,7 +536,7 @@ impl LatticeDb {
 
     /// List keys with pagination.
     pub async fn keys_paged(&self, table: &str, cursor: Option<u64>) -> Result<KeysPage, Error> {
-        let resp: KeysR = self.req("ldb.keys", &KeysReqW { table, cursor }).await?;
+        let resp: KeysR = self.req(&self.subj("keys"), &KeysReqW { table, cursor }).await?;
         Ok(KeysPage { keys: resp.keys, cursor: resp.cursor })
     }
 
@@ -546,7 +545,7 @@ impl LatticeDb {
     /// Scan rows with filters, sorting, and pagination.
     pub async fn scan(&self, table: &str, query: ScanQuery) -> Result<ScanResult, Error> {
         let order_by = query.order_by.map(|(f, o)| SortByW { field: f, order: o });
-        let resp: ScanR = self.req("ldb.scan", &ScanReqW {
+        let resp: ScanR = self.req(&self.subj("scan"), &ScanReqW {
             table,
             filters: &query.filters,
             order_by,
@@ -566,7 +565,7 @@ impl LatticeDb {
 
     /// Count rows matching filters.
     pub async fn count(&self, table: &str, filters: &[Filter]) -> Result<u64, Error> {
-        let resp: CountR = self.req("ldb.count", &CountReqW { table, filters }).await?;
+        let resp: CountR = self.req(&self.subj("count"), &CountReqW { table, filters }).await?;
         Ok(resp.count)
     }
 
@@ -574,7 +573,7 @@ impl LatticeDb {
 
     /// Get multiple keys in one request.
     pub async fn batch_get(&self, table: &str, keys: &[&str]) -> Result<Vec<BatchGetResult>, Error> {
-        let resp: BatchGetR = self.req("ldb.batch.get", &BatchGetReqW { table, keys }).await?;
+        let resp: BatchGetR = self.req(&self.subj("batch.get"), &BatchGetReqW { table, keys }).await?;
         let results = resp.results.into_iter().map(|r| {
             let value = r.value.as_ref().and_then(|v| B64.decode(v).ok());
             BatchGetResult { key: r.key, value, revision: r.revision, error: r.error }
@@ -589,7 +588,7 @@ impl LatticeDb {
             value: B64.encode(e.value),
             ttl_seconds: e.ttl_seconds,
         }).collect();
-        let resp: BatchPutR = self.req("ldb.batch.put", &BatchPutReqW { table, entries: wire_entries }).await?;
+        let resp: BatchPutR = self.req(&self.subj("batch.put"), &BatchPutReqW { table, entries: wire_entries }).await?;
         Ok(resp.results.into_iter().map(|r| BatchPutResult { key: r.key, revision: r.revision }).collect())
     }
 
@@ -597,7 +596,7 @@ impl LatticeDb {
 
     /// Create a single-field secondary index.
     pub async fn create_index(&self, table: &str, field: &str) -> Result<(), Error> {
-        let _: serde_json::Value = self.req("ldb.index.create", &IndexCreateReqW {
+        let _: serde_json::Value = self.req(&self.subj("index.create"), &IndexCreateReqW {
             table, field: Some(field), fields: None,
         }).await?;
         Ok(())
@@ -605,7 +604,7 @@ impl LatticeDb {
 
     /// Create a compound (multi-field) index.
     pub async fn create_compound_index(&self, table: &str, fields: &[&str]) -> Result<(), Error> {
-        let _: serde_json::Value = self.req("ldb.index.create", &IndexCreateReqW {
+        let _: serde_json::Value = self.req(&self.subj("index.create"), &IndexCreateReqW {
             table, field: None, fields: Some(fields.to_vec()),
         }).await?;
         Ok(())
@@ -613,13 +612,13 @@ impl LatticeDb {
 
     /// Drop an index.
     pub async fn drop_index(&self, table: &str, field: &str) -> Result<(), Error> {
-        let _: serde_json::Value = self.req("ldb.index.drop", &FieldReqW { table, field }).await?;
+        let _: serde_json::Value = self.req(&self.subj("index.drop"), &FieldReqW { table, field }).await?;
         Ok(())
     }
 
     /// List all indexes on a table.
     pub async fn list_indexes(&self, table: &str) -> Result<Vec<String>, Error> {
-        let resp: IndexesR = self.req("ldb.index.list", &TableReq { table }).await?;
+        let resp: IndexesR = self.req(&self.subj("index.list"), &TableReq { table }).await?;
         Ok(resp.indexes)
     }
 
@@ -627,7 +626,7 @@ impl LatticeDb {
 
     /// Execute an atomic multi-key transaction.
     pub async fn transaction(&self, ops: Vec<TxnOp>) -> Result<TxnResult, Error> {
-        let resp: TxnR = self.req("ldb.txn", &TxnReqW { ops }).await?;
+        let resp: TxnR = self.req(&self.subj("txn"), &TxnReqW { ops }).await?;
         Ok(TxnResult { ok: resp.ok, results: resp.results })
     }
 
@@ -641,7 +640,7 @@ impl LatticeDb {
         group_by: Option<&str>,
         ops: &[AggOp],
     ) -> Result<Vec<AggGroup>, Error> {
-        let resp: AggR = self.req("ldb.aggregate", &AggReqW {
+        let resp: AggR = self.req(&self.subj("aggregate"), &AggReqW {
             table, filters, group_by, ops,
         }).await?;
         Ok(resp.groups)
@@ -651,36 +650,38 @@ impl LatticeDb {
 
     /// Set a JSON schema for a table.
     pub async fn set_schema(&self, table: &str, schema: &serde_json::Value) -> Result<(), Error> {
-        let _: serde_json::Value = self.req("ldb.schema.set", &SchemaSetReqW { table, schema }).await?;
+        let _: serde_json::Value = self.req(&self.subj("schema.set"), &SchemaSetReqW { table, schema }).await?;
         Ok(())
     }
 
     /// Get the schema for a table. Returns `None` if no schema is set.
     pub async fn get_schema(&self, table: &str) -> Result<Option<serde_json::Value>, Error> {
-        let resp: SchemaR = self.req("ldb.schema.get", &TableReq { table }).await?;
+        let resp: SchemaR = self.req(&self.subj("schema.get"), &TableReq { table }).await?;
         if resp.schema.is_null() { Ok(None) } else { Ok(Some(resp.schema)) }
     }
 
     /// Delete the schema for a table.
     pub async fn delete_schema(&self, table: &str) -> Result<(), Error> {
-        let _: serde_json::Value = self.req("ldb.schema.delete", &TableReq { table }).await?;
+        let _: serde_json::Value = self.req(&self.subj("schema.delete"), &TableReq { table }).await?;
         Ok(())
     }
 
     // ── Internal ───────────────────────────────────────────────
 
+    /// Build the full NATS subject for an operation.
+    fn subj(&self, op: &str) -> String {
+        format!("{}.{op}", self.instance)
+    }
+
     /// Send a request and deserialize the response, checking for error.
     ///
-    /// Injects `_auth` and `_partition` into every request when configured.
+    /// Injects `_auth` into every request when configured.
     async fn req<Q: Serialize, R: DeserializeOwned>(&self, subject: &str, payload: &Q) -> Result<R, Error> {
-        // Serialize to Value so we can inject auth / partition fields.
+        // Serialize to Value so we can inject the auth field.
         let mut value = serde_json::to_value(payload).map_err(|e| Error::Json(e.to_string()))?;
         if let Some(obj) = value.as_object_mut() {
             if let Some(ref token) = self.auth_token {
                 obj.insert("_auth".to_string(), serde_json::Value::String(token.clone()));
-            }
-            if let Some(ref part) = self.partition {
-                obj.insert("_partition".to_string(), serde_json::Value::String(part.clone()));
             }
         }
         let body = serde_json::to_vec(&value).map_err(|e| Error::Json(e.to_string()))?;
