@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.3.0] - 2026-04-28
+
+### Added
+
+- **Multi-cluster NATS support**: Support for separate NATS clusters for messaging and data storage via `NATS_DATA_URL`.
+  - `NATS_URL` is now used for request/reply subscriptions and change events.
+  - `NATS_DATA_URL` (new) is used for JetStream WAL and KV storage.
+  - Defaults to `NATS_URL` if not provided, maintaining backward compatibility.
+
+### Changed
+
+- **`storage-service/src/main.rs`**: Updated to establish two NATS connections when `NATS_DATA_URL` is provided.
+- **`deploy/`**: Updated deployment examples to include `NATS_DATA_URL`.
+
 ## [1.2.1] - 2026-04-23
 
 ### Fixes & cleanup

@@ -69,6 +69,8 @@ Deploy one `storage-service` per application. Set `LDB_INSTANCE` in each deploym
 |---|---|
 | `LDB_INSTANCE=instancename` | Subjects: `instancename.get`, `instancename.put`, … KV: `instancename-users`, `instancename-products`, … WAL: `instancename-txn` |
 | `LDB_AUTH_TOKEN=...` | Every request must include `"_auth": "<token>"` |
+| `NATS_URL=...` | NATS address for messaging (req/rep subscriptions and events) |
+| `NATS_DATA_URL=...` | NATS address for storage (JetStream WAL and KV buckets). Defaults to `NATS_URL`. |
 
 `LDB_INSTANCE` defaults to `ldb`. Allowed characters: alphanumeric, `_`, `-`; max 64 chars.
 

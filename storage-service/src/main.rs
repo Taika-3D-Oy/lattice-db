@@ -30,11 +30,15 @@ impl wasip3::exports::cli::run::Guest for LatticeDb {
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    // NATS address: env var > argv > default.
-    let nats_addr = std::env::var("NATS_URL")
+    // NATS addresses: env var > argv > default.
+    let nats_msg_addr = std::env::var("NATS_URL")
         .ok()
         .or_else(|| std::env::args().nth(1))
         .unwrap_or_else(|| "127.0.0.1:4222".to_string());
+
+    let nats_data_addr = std::env::var("NATS_DATA_URL")
+        .ok()
+        .unwrap_or_else(|| nats_msg_addr.clone());
 
     // TLS: enabled if NATS_TLS=1 is set.
     // Note: wasip3 uses host-side TLS via wasi:tls — no in-wasm crypto.
@@ -45,20 +49,32 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         log_info!("TLS enabled (host-side wasi:tls)");
     }
 
-    eprintln!("lattice-db: connecting to NATS at {nats_addr}");
-
-    let client = Client::connect(ConnectConfig {
-        address: nats_addr.to_string(),
-        name: Some("lattice-db".to_string()),
+    eprintln!("lattice-db: connecting to NATS (messaging) at {nats_msg_addr}");
+    let msg_client = Client::connect(ConnectConfig {
+        address: nats_msg_addr.to_string(),
+        name: Some("lattice-db-msg".to_string()),
         tls: use_tls,
         ..Default::default()
     })
     .await?;
 
+    let data_client = if nats_data_addr == nats_msg_addr {
+        msg_client.clone()
+    } else {
+        eprintln!("lattice-db: connecting to NATS (data) at {nats_data_addr}");
+        Client::connect(ConnectConfig {
+            address: nats_data_addr.to_string(),
+            name: Some("lattice-db-data".to_string()),
+            tls: use_tls,
+            ..Default::default()
+        })
+        .await?
+    };
+
     eprintln!(
-        "lattice-db: connected to {} ({})",
-        client.server_info().server_name,
-        client.server_info().version,
+        "lattice-db: connected to messaging={} data={}",
+        msg_client.server_info().server_name,
+        data_client.server_info().server_name,
     );
 
     // Instance name: drives all NATS subject and KV bucket prefixes so that
@@ -76,8 +92,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let shared_state = state::new_shared_state();
-    let shared_store = store::new_shared_store(client.clone(), instance.clone());
-    let js = JetStream::new(client.clone());
+    let shared_store = store::new_shared_store(data_client.clone(), instance.clone());
+    let js = JetStream::new(data_client.clone());
 
     // Auth config.
     let auth_token = std::env::var("LDB_AUTH_TOKEN").ok();
@@ -293,7 +309,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Subscribe to all lattice-db operations (queue group for scaling).
     let sub_subject = format!("{instance}.>");
     let queue_group = format!("{instance}-workers");
-    let sub = client.subscribe_queue(&sub_subject, &queue_group)?;
+    let sub = msg_client.subscribe_queue(&sub_subject, &queue_group)?;
 
     eprintln!("lattice-db: listening on {sub_subject} (queue group: {queue_group})");
 
@@ -301,13 +317,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         let msg = sub.next().await?;
 
         // Spawn a task per request for concurrency.
-        let client = client.clone();
+        let msg_client = msg_client.clone();
         let js = js.clone();
         let cfg = config.clone();
         let state = shared_state.clone();
         let store = shared_store.clone();
         wit_bindgen::spawn(async move {
-            handler::handle(&client, &js, &cfg, &state, &store, msg).await;
+            handler::handle(&msg_client, &js, &cfg, &state, &store, msg).await;
         });
     }
 }

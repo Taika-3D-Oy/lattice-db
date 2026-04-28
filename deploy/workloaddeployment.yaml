@@ -21,6 +21,7 @@ spec:
           environment:
             config:
               NATS_URL: "__NATS_URL__"
+              NATS_DATA_URL: "__NATS_DATA_URL__"
       hostInterfaces:
         # The service needs outgoing TCP to connect to NATS.
         - namespace: wasi
