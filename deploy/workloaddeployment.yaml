@@ -22,6 +22,8 @@ spec:
             config:
               NATS_URL: "__NATS_URL__"
               NATS_DATA_URL: "__NATS_DATA_URL__"
+              LDB_INSTANCE: "__LDB_INSTANCE__"
+              LDB_DATA_INSTANCE: "__LDB_DATA_INSTANCE__"
       hostInterfaces:
         # The service needs outgoing TCP to connect to NATS.
         - namespace: wasi

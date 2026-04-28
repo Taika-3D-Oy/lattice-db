@@ -54,10 +54,9 @@ const MAX_BATCH_SIZE: usize = 256;
 pub struct Config {
     pub auth_token: Option<String>,
     /// NATS subject prefix for this instance (matches `LDB_INSTANCE`).
-    /// Requests arrive on `{instance}.{op}`, KV buckets are named
-    /// `{instance}-{table}`, and change events are published to
-    /// `{instance}-events.{table}.{key}`.
     pub instance: String,
+    /// NATS KV bucket and WAL prefix (matches `LDB_DATA_INSTANCE`).
+    pub data_instance: String,
 }
 
 pub type SharedConfig = Rc<Config>;
@@ -342,7 +341,7 @@ pub async fn handle(
         "index.create" => handle_index_create(state, store, &payload).await,
         "index.drop" => handle_index_drop(state, store, &payload).await,
         "index.list" => handle_index_list(state, &payload),
-        "txn" => handle_txn(js, state, store, &payload, instance).await,
+        "txn" => handle_txn(js, state, store, &payload, config.data_instance.as_str()).await,
         "batch.get" => handle_batch_get(state, store, &payload).await,
         "batch.put" => handle_batch_put(client, state, store, &payload, instance).await,
         "aggregate" => handle_aggregate(state, store, &payload).await,

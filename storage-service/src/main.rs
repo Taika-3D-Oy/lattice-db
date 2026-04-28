@@ -77,22 +77,22 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         data_client.server_info().server_name,
     );
 
-    // Instance name: drives all NATS subject and KV bucket prefixes so that
-    // multiple lattice-db deployments sharing one NATS cluster stay isolated.
+    // Instance names: drive NATS subject and KV bucket prefixes.
     let instance = {
         let raw = std::env::var("LDB_INSTANCE").unwrap_or_else(|_| "ldb".to_string());
-        if raw.is_empty() || raw.len() > 64 {
-            return Err("LDB_INSTANCE must be 1–64 characters".into());
-        }
-        if !raw.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-') {
-            return Err("LDB_INSTANCE may only contain alphanumeric characters, _ and -".into());
-        }
-        eprintln!("lattice-db: instance = {raw}");
+        validate_instance_name("LDB_INSTANCE", &raw)?;
+        eprintln!("lattice-db: instance (messaging) = {raw}");
+        raw
+    };
+    let data_instance = {
+        let raw = std::env::var("LDB_DATA_INSTANCE").unwrap_or_else(|_| instance.clone());
+        validate_instance_name("LDB_DATA_INSTANCE", &raw)?;
+        eprintln!("lattice-db: instance (data) = {raw}");
         raw
     };
 
     let shared_state = state::new_shared_state();
-    let shared_store = store::new_shared_store(data_client.clone(), instance.clone());
+    let shared_store = store::new_shared_store(data_client.clone(), data_instance.clone());
     let js = JetStream::new(data_client.clone());
 
     // Auth config.
@@ -103,15 +103,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config: handler::SharedConfig = Rc::new(handler::Config {
         auth_token,
         instance: instance.clone(),
+        data_instance: data_instance.clone(),
     });
 
     // Set up WAL stream and recover incomplete transactions.
     txn::init_node_id();
-    txn::ensure_wal_stream(&js, &instance)
+    txn::ensure_wal_stream(&js, &data_instance)
         .await
         .map_err(|e| format!("wal stream setup: {e}"))?;
 
-    let recovered = txn::recover(&js, &shared_state, &shared_store, &instance).await?;
+    let recovered = txn::recover(&js, &shared_state, &shared_store, &data_instance).await?;
     if recovered > 0 {
         eprintln!("lattice-db: recovered {recovered} incomplete transaction(s)");
     }
@@ -326,4 +327,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             handler::handle(&msg_client, &js, &cfg, &state, &store, msg).await;
         });
     }
+}
+
+fn validate_instance_name(var: &str, name: &str) -> Result<(), String> {
+    if name.is_empty() || name.len() > 64 {
+        return Err(format!("{var} must be 1–64 characters"));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err(format!(
+            "{var} may only contain alphanumeric characters, _ and -"
+        ));
+    }
+    Ok(())
 }

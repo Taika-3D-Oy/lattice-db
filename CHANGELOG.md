@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.4.0] - 2026-04-28
+
+### Added
+
+- **Multi-instance isolation**: Support for separate instance names for messaging and data storage via `LDB_DATA_INSTANCE`.
+  - `LDB_INSTANCE` is used for NATS subject prefixes and event publishing.
+  - `LDB_DATA_INSTANCE` (new) is used for NATS KV bucket names and JetStream WAL.
+  - Defaults to `LDB_INSTANCE` if not provided, maintaining backward compatibility.
+
 ## [1.3.0] - 2026-04-28
 
 ### Added

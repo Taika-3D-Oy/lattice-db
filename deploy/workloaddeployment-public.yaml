@@ -26,6 +26,8 @@ spec:
               # If DNS is unavailable in your runtime/network stack, use a direct service IP.
               NATS_URL: "nats:4222"
               NATS_DATA_URL: "nats-data:4222"
+              LDB_INSTANCE: "ldb"
+              LDB_DATA_INSTANCE: "ldb-data"
       hostInterfaces:
         # Required so the service can open outgoing TCP connections to NATS.
         - namespace: wasi
