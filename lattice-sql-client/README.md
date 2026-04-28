@@ -2,7 +2,7 @@
 
 Typed Rust SDK for [lattice-sql](https://github.com/Taika-3D-Oy/lattice-db) — the SQL frontend for [lattice-db](https://github.com/Taika-3D-Oy/lattice-db).
 
-Sends SQL strings to the `ldb.sql.query` NATS subject and maps the responses back to strongly-typed Rust values. Sits above `lattice-db-client` in the stack: you write SQL, not raw key-value operations.
+Sends SQL strings to the `ldb.sql.query` NATS subject (where `ldb` is your `LDB_INSTANCE`) and maps the responses back to strongly-typed Rust values. Sits above `lattice-db-client` in the stack: you write SQL, not raw key-value operations.
 
 ## Requirements
 

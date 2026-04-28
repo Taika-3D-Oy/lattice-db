@@ -4,24 +4,19 @@
 
 ### Added
 
-- **Multi-instance isolation**: Support for separate instance names for messaging and data storage via `LDB_DATA_INSTANCE`.
-  - `LDB_INSTANCE` is used for NATS subject prefixes and event publishing.
-  - `LDB_DATA_INSTANCE` (new) is used for NATS KV bucket names and JetStream WAL.
-  - Defaults to `LDB_INSTANCE` if not provided, maintaining backward compatibility.
-
-## [1.3.0] - 2026-04-28
-
-### Added
-
 - **Multi-cluster NATS support**: Support for separate NATS clusters for messaging and data storage via `NATS_DATA_URL`.
   - `NATS_URL` is now used for request/reply subscriptions and change events.
   - `NATS_DATA_URL` (new) is used for JetStream WAL and KV storage.
-  - Defaults to `NATS_URL` if not provided, maintaining backward compatibility.
+- **Multi-instance isolation**: Support for separate instance names for messaging and data storage via `LDB_DATA_INSTANCE`.
+  - `LDB_INSTANCE` is used for NATS subject prefixes and event publishing.
+  - `LDB_DATA_INSTANCE` (new) is used for NATS KV bucket names and JetStream WAL.
+  - Both default to the messaging counterparts if not provided, maintaining backward compatibility.
 
 ### Changed
 
-- **`storage-service/src/main.rs`**: Updated to establish two NATS connections when `NATS_DATA_URL` is provided.
-- **`deploy/`**: Updated deployment examples to include `NATS_DATA_URL`.
+- **`storage-service/src/main.rs`**: Updated to establish separate NATS connections and use separate instance prefixes when configured.
+- **`deploy/`**: Updated deployment examples to include `NATS_DATA_URL` and `LDB_DATA_INSTANCE`.
+- **Version Bumps**: Bumped all workspace crates (`lattice-db-client`, `lattice-sql`, `lattice-sql-client`) to `1.4.0` for project-wide consistency.
 
 ## [1.2.1] - 2026-04-23
 

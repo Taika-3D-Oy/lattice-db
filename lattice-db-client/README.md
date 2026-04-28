@@ -89,7 +89,7 @@ let db = LatticeDb::new(client)
     .with_instance("acme");
 ```
 
-The instance prefix defaults to `"ldb"`. All NATS subjects and KV bucket names are derived from it, so each lattice-db deployment on the same cluster stays fully isolated.
+The instance name (default `"ldb"`) must match the server's `LDB_INSTANCE` configuration. This drives all NATS subject prefixes for messaging and change events. If the server is configured with a separate `LDB_DATA_INSTANCE` for storage, the client still only needs to know the messaging `LDB_INSTANCE`. Each lattice-db deployment on the same cluster remains isolated by these prefixes.
 
 ## Building
 
