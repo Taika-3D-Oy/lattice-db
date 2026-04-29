@@ -1,5 +1,23 @@
 # Changelog
 
+## [1.6.0] - 2026-04-29
+
+### Added
+
+- **Session consistency tokens** (read-your-write across replicas):
+  - Read operations accept an optional `consistency.min_revision` for table-scoped freshness.
+  - Write and transaction responses include optional `session.revisions` metadata so callers can propagate consistency context across stateless app hops.
+- **Bounded watcher-wait before reload**:
+  - On a consistency-gated read, replicas now wait briefly for KV watcher catch-up before forcing a full table reload.
+  - This keeps the common lag case cheap while preserving correctness fallback behavior.
+- **Configurable consistency wait tuning**:
+  - `LDB_CONSISTENCY_WATCHER_WAIT_STEPS` (default: `2`, range: `0..60`)
+  - `LDB_CONSISTENCY_WATCHER_WAIT_STEP_SECS` (default: `1`, range: `0..30`)
+
+### Changed
+
+- **Version Bumps**: Bumped all core crates to `1.6.0` (`storage-service`, `lattice-db-client`, `lattice-sql`, `lattice-sql-client`).
+
 ## [1.5.0] - 2026-04-29
 
 ### Added

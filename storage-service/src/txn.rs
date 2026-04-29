@@ -25,6 +25,7 @@
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::cell::Cell;
+use std::collections::HashMap;
 
 use nats_wasi::client::secs;
 use nats_wasi::jetstream::{JetStream, StreamConfig};
@@ -113,6 +114,13 @@ pub struct TxnOpResult {
 pub struct TxnResponse {
     pub ok: bool,
     pub results: Vec<TxnOpResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session: Option<TxnSession>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TxnSession {
+    pub revisions: HashMap<String, u64>,
 }
 
 // ── WAL record ─────────────────────────────────────────────────────
@@ -310,7 +318,25 @@ pub async fn execute(
         .await
         .map_err(|e| format!("wal commit write: {e}"))?;
 
-    Ok(TxnResponse { ok: true, results })
+    let mut revisions: HashMap<String, u64> = HashMap::new();
+    for result in &results {
+        if let Some(revision) = result.revision {
+            let entry = revisions.entry(result.table.clone()).or_insert(0);
+            if revision > *entry {
+                *entry = revision;
+            }
+        }
+    }
+
+    Ok(TxnResponse {
+        ok: true,
+        results,
+        session: if revisions.is_empty() {
+            None
+        } else {
+            Some(TxnSession { revisions })
+        },
+    })
 }
 
 // ── Recovery ───────────────────────────────────────────────────────

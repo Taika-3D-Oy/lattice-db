@@ -44,6 +44,8 @@ pub struct TableState {
     pub loaded: bool,
     /// Whether a background KV watcher is running for this table.
     pub watching: bool,
+    /// Highest KV revision known to be applied to this table state.
+    pub applied_revision: u64,
 }
 
 impl TableState {
@@ -55,6 +57,7 @@ impl TableState {
             schema: None,
             loaded: false,
             watching: false,
+            applied_revision: 0,
         }
     }
 
@@ -72,6 +75,7 @@ impl TableState {
 
         self.data
             .insert(key.to_string(), CachedRow { value, revision });
+        self.note_applied_revision(revision);
     }
 
     /// Remove a row from the cache and all indexes.
@@ -79,6 +83,13 @@ impl TableState {
         self.remove_from_indexes(key);
         self.remove_from_compound_indexes(key);
         self.data.remove(key);
+    }
+
+    /// Track that this table has observed and applied at least `revision`.
+    pub fn note_applied_revision(&mut self, revision: u64) {
+        if revision > self.applied_revision {
+            self.applied_revision = revision;
+        }
     }
 
     /// Create a secondary index on a JSON field and backfill it.

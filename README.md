@@ -40,16 +40,16 @@ All requests are NATS request/reply on `ldb.{op}`. Bodies are JSON; binary value
 
 | Subject | Body |
 |---|---|
-| `ldb.get` / `ldb.exists` / `ldb.keys` | `{table, key}` / `{table, cursor?}` |
+| `ldb.get` / `ldb.exists` / `ldb.keys` | `{table, key, consistency?}` / `{table, cursor?, consistency?}` |
 | `ldb.put` / `ldb.create` | `{table, key, value, ttl_seconds?}` |
 | `ldb.cas` | `{table, key, value, revision, ttl_seconds?}` |
 | `ldb.delete` | `{table, key}` |
 | `ldb.cas_delete` | `{table, key, revision}` |
 | `ldb.purge` | `{table, key, revision?, ttl_seconds?}` |
-| `ldb.get_revision` | `{table, key, revision}` — includes delete/purge tombstones |
-| `ldb.batch.get` / `ldb.batch.put` | `{table, keys: [...]}` / `{table, entries: [...]}` |
-| `ldb.scan` / `ldb.count` | `{table, filters, order_by?, limit?, offset?, key_prefix?}` |
-| `ldb.aggregate` | `{table, filters, group_by?, ops: [{fn, field?}]}` (`count`/`sum`/`avg`/`min`/`max`) |
+| `ldb.get_revision` | `{table, key, revision, consistency?}` — includes delete/purge tombstones |
+| `ldb.batch.get` / `ldb.batch.put` | `{table, keys: [...], consistency?}` / `{table, entries: [...]}` |
+| `ldb.scan` / `ldb.count` | `{table, filters, order_by?, limit?, offset?, key_prefix?, consistency?}` |
+| `ldb.aggregate` | `{table, filters, group_by?, ops: [{fn, field?}], consistency?}` (`count`/`sum`/`avg`/`min`/`max`) |
 | `ldb.index.create` / `ldb.index.drop` / `ldb.index.list` | `{table, field}` or `{table, fields: [...]}` (compound) |
 | `ldb.txn` | `{ops: [{op, table, key, value?}]}` — atomic, max 64 ops |
 | `ldb.schema.set` / `ldb.schema.get` / `ldb.schema.delete` | `{table, schema}` |
@@ -61,6 +61,20 @@ Every mutation also publishes a change event on `ldb-events.{table}.{key}`:
 ```bash
 nats sub "ldb-events.users.>"
 ```
+
+Session-consistent clients can carry a per-table watermark via:
+
+```json
+"consistency": { "min_revision": 123 }
+```
+
+Write responses may include:
+
+```json
+"session": { "revisions": { "users": 123 } }
+```
+
+This enables read-your-write behavior even when traffic hops across app and storage replicas.
 
 ## Instance isolation
 
@@ -75,6 +89,8 @@ Deploy one `storage-service` per application. Set `LDB_INSTANCE` in each deploym
 | `LDB_AUTH_TOKEN=...` | Every request must include `"_auth": "<token>"` |
 | `NATS_URL=...` | NATS address for messaging (req/rep subscriptions and events) |
 | `NATS_DATA_URL=...` | NATS address for storage (JetStream WAL and KV buckets). Defaults to `NATS_URL`. |
+| `LDB_CONSISTENCY_WATCHER_WAIT_STEPS` | Number of short watcher-poll attempts before forced table reload on consistency-gated reads. Default `2` (range `0..60`). |
+| `LDB_CONSISTENCY_WATCHER_WAIT_STEP_SECS` | Seconds per watcher-poll attempt. Default `1` (range `0..30`). |
 
 `LDB_INSTANCE` defaults to `ldb`. Allowed characters: alphanumeric, `_`, `-`; max 64 chars.
 

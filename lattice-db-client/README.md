@@ -17,7 +17,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-lattice-db-client = "1.5"
+lattice-db-client = "1.6"
 nats-wasip3 = "0.8"
 ```
 
@@ -95,6 +95,14 @@ let db = LatticeDb::new(client)
 ```
 
 The instance name (default `"ldb"`) must match the server's `LDB_INSTANCE` configuration. This drives all NATS subject prefixes for messaging and change events. If the server is configured with a separate `LDB_DATA_INSTANCE` for storage, the client still only needs to know the messaging `LDB_INSTANCE`. Each lattice-db deployment on the same cluster remains isolated by these prefixes.
+
+## Session consistency tokens
+
+`LatticeDb` now automatically tracks per-table session watermarks from server responses and sends `consistency.min_revision` on later table-scoped reads.
+
+- No app-side token plumbing is required when requests reuse the same `LatticeDb` instance.
+- This provides session-level read-your-write behavior across queue-grouped replicas.
+- For stateless HTTP tiers, forward the returned session state between hops if you create a fresh client per request.
 
 ## Building
 

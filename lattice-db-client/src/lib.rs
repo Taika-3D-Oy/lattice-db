@@ -45,6 +45,8 @@
 use base64::Engine;
 use nats_wasi::client::{Client, Duration, secs};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use std::cell::RefCell;
+use std::collections::HashMap;
 
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
 
@@ -421,6 +423,7 @@ struct SchemaSetReqW<'a> { table: &'a str, schema: &'a serde_json::Value }
 #[derive(Deserialize)] struct SchemaR { schema: serde_json::Value }
 #[derive(Deserialize)] struct RevisionEntryR { key: String, value: String, revision: u64, operation: String }
 #[derive(Deserialize)] struct ErrorR { error: Option<String> }
+#[derive(Deserialize)] struct SessionR { revisions: HashMap<String, u64> }
 
 // ── Client ─────────────────────────────────────────────────────────
 
@@ -433,17 +436,31 @@ pub struct LatticeDb {
     auth_token: Option<String>,
     /// NATS subject prefix. Must match `LDB_INSTANCE` on the server (default `ldb`).
     instance: String,
+    /// Session-level per-table minimum revisions for read-your-write behavior.
+    session_revisions: RefCell<HashMap<String, u64>>,
 }
 
 impl LatticeDb {
     /// Create a new client with the default 5-second timeout.
     pub fn new(client: Client) -> Self {
-        Self { client, timeout: secs(5), auth_token: None, instance: "ldb".to_string() }
+        Self {
+            client,
+            timeout: secs(5),
+            auth_token: None,
+            instance: "ldb".to_string(),
+            session_revisions: RefCell::new(HashMap::new()),
+        }
     }
 
     /// Create a new client with a custom timeout (nanoseconds).
     pub fn with_timeout(client: Client, timeout: Duration) -> Self {
-        Self { client, timeout, auth_token: None, instance: "ldb".to_string() }
+        Self {
+            client,
+            timeout,
+            auth_token: None,
+            instance: "ldb".to_string(),
+            session_revisions: RefCell::new(HashMap::new()),
+        }
     }
 
     /// Attach a shared auth token. Sent as `_auth` in every request.
@@ -781,15 +798,61 @@ impl LatticeDb {
             if let Some(ref token) = self.auth_token {
                 obj.insert("_auth".to_string(), serde_json::Value::String(token.clone()));
             }
+            if let Some(table) = obj.get("table").and_then(|t| t.as_str()) {
+                if let Some(min_revision) = self
+                    .session_revisions
+                    .borrow()
+                    .get(table)
+                    .copied()
+                {
+                    obj.insert(
+                        "consistency".to_string(),
+                        serde_json::json!({ "min_revision": min_revision }),
+                    );
+                }
+            }
         }
         let body = serde_json::to_vec(&value).map_err(|e| Error::Json(e.to_string()))?;
         let reply = self.client.request(subject, &body, self.timeout).await?;
+        let reply_value: serde_json::Value =
+            serde_json::from_slice(&reply.payload).map_err(|e| Error::Json(e.to_string()))?;
+
         // Check for error response first.
-        if let Ok(err) = serde_json::from_slice::<ErrorR>(&reply.payload) {
+        if let Ok(err) = serde_json::from_value::<ErrorR>(reply_value.clone()) {
             if let Some(msg) = err.error {
                 return Err(Error::Db(msg));
             }
         }
-        serde_json::from_slice(&reply.payload).map_err(|e| Error::Json(e.to_string()))
+
+        if let Some(obj) = reply_value.as_object() {
+            if let Some(session_val) = obj.get("session") {
+                if let Ok(session) = serde_json::from_value::<SessionR>(session_val.clone()) {
+                    let mut local = self.session_revisions.borrow_mut();
+                    for (table, revision) in session.revisions {
+                        let entry = local.entry(table).or_insert(0);
+                        if revision > *entry {
+                            *entry = revision;
+                        }
+                    }
+                }
+            }
+
+            // Backward-compatible fallback: infer from {table, revision} responses.
+            if let (Some(table), Some(revision)) = (
+                value
+                    .as_object()
+                    .and_then(|o| o.get("table"))
+                    .and_then(|v| v.as_str()),
+                obj.get("revision").and_then(|v| v.as_u64()),
+            ) {
+                let mut local = self.session_revisions.borrow_mut();
+                let entry = local.entry(table.to_string()).or_insert(0);
+                if revision > *entry {
+                    *entry = revision;
+                }
+            }
+        }
+
+        serde_json::from_value(reply_value).map_err(|e| Error::Json(e.to_string()))
     }
 }

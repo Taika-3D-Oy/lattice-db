@@ -26,7 +26,9 @@
 
 use base64::Engine;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::OnceLock;
 
 use nats_wasi::client::{secs, Client, Message};
 use nats_wasi::jetstream::JetStream;
@@ -52,6 +54,53 @@ const MAX_TABLE_LEN: usize = 128;
 /// Maximum number of entries in a batch.put request.
 const MAX_BATCH_SIZE: usize = 256;
 
+/// Max number of watcher polling intervals before forcing a table reload.
+const DEFAULT_CONSISTENCY_WATCHER_WAIT_STEPS: u32 = 2;
+/// Duration of each watcher polling interval.
+const DEFAULT_CONSISTENCY_WATCHER_WAIT_STEP_SECS: u64 = 1;
+
+fn env_u32(name: &str, default: u32, min: u32, max: u32) -> u32 {
+    let raw = match std::env::var(name) {
+        Ok(v) => v,
+        Err(_) => return default,
+    };
+    let parsed = raw.parse::<u32>().ok().unwrap_or(default);
+    parsed.clamp(min, max)
+}
+
+fn env_u64(name: &str, default: u64, min: u64, max: u64) -> u64 {
+    let raw = match std::env::var(name) {
+        Ok(v) => v,
+        Err(_) => return default,
+    };
+    let parsed = raw.parse::<u64>().ok().unwrap_or(default);
+    parsed.clamp(min, max)
+}
+
+fn consistency_watcher_wait_steps() -> u32 {
+    static STEPS: OnceLock<u32> = OnceLock::new();
+    *STEPS.get_or_init(|| {
+        env_u32(
+            "LDB_CONSISTENCY_WATCHER_WAIT_STEPS",
+            DEFAULT_CONSISTENCY_WATCHER_WAIT_STEPS,
+            0,
+            60,
+        )
+    })
+}
+
+fn consistency_watcher_wait_step_secs() -> u64 {
+    static SECS: OnceLock<u64> = OnceLock::new();
+    *SECS.get_or_init(|| {
+        env_u64(
+            "LDB_CONSISTENCY_WATCHER_WAIT_STEP_SECS",
+            DEFAULT_CONSISTENCY_WATCHER_WAIT_STEP_SECS,
+            0,
+            30,
+        )
+    })
+}
+
 // ── Config ────────────────────────────────────────────────────────────
 
 pub struct Config {
@@ -67,9 +116,22 @@ pub type SharedConfig = Rc<Config>;
 // ── Request types ──────────────────────────────────────────────────
 
 #[derive(Deserialize)]
+struct ConsistencyReq {
+    #[serde(default)]
+    min_revision: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct SessionToken {
+    revisions: HashMap<String, u64>,
+}
+
+#[derive(Deserialize)]
 struct KeyReq {
     table: String,
     key: String,
+    #[serde(default)]
+    consistency: Option<ConsistencyReq>,
 }
 
 #[derive(Deserialize)]
@@ -113,6 +175,8 @@ struct GetRevisionReq {
     table: String,
     key: String,
     revision: u64,
+    #[serde(default)]
+    consistency: Option<ConsistencyReq>,
 }
 
 #[derive(Deserialize)]
@@ -125,6 +189,8 @@ struct KeysReq {
     table: String,
     #[serde(default)]
     cursor: Option<u64>,
+    #[serde(default)]
+    consistency: Option<ConsistencyReq>,
 }
 
 #[derive(Deserialize)]
@@ -146,6 +212,8 @@ struct ScanReq {
     offset: Option<u32>,
     #[serde(default)]
     key_prefix: Option<String>,
+    #[serde(default)]
+    consistency: Option<ConsistencyReq>,
 }
 
 #[derive(Deserialize)]
@@ -164,12 +232,16 @@ struct CountReq {
     table: String,
     #[serde(default)]
     filters: Vec<FieldFilter>,
+    #[serde(default)]
+    consistency: Option<ConsistencyReq>,
 }
 
 #[derive(Deserialize)]
 struct BatchGetReq {
     table: String,
     keys: Vec<String>,
+    #[serde(default)]
+    consistency: Option<ConsistencyReq>,
 }
 
 #[derive(Deserialize)]
@@ -194,6 +266,8 @@ struct AggregateReq {
     #[serde(default)]
     group_by: Option<String>,
     ops: Vec<AggOpReq>,
+    #[serde(default)]
+    consistency: Option<ConsistencyReq>,
 }
 
 #[derive(Deserialize)]
@@ -228,11 +302,15 @@ struct RowResp {
     key: String,
     value: String, // base64
     revision: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session: Option<SessionToken>,
 }
 
 #[derive(Serialize)]
 struct RevisionResp {
     revision: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session: Option<SessionToken>,
 }
 
 #[derive(Serialize)]
@@ -304,6 +382,8 @@ struct BatchPutResult {
 #[derive(Serialize)]
 struct BatchPutResp {
     results: Vec<BatchPutResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session: Option<SessionToken>,
 }
 
 #[derive(Serialize)]
@@ -440,6 +520,7 @@ async fn ensure_loaded(
             ts.upsert(&entry.key, entry.value, entry.revision);
         }
         ts.loaded = true;
+        ts.note_applied_revision(max_rev);
         max_rev
     } else {
         // Already loaded — start the watcher from the highest revision we hold.
@@ -460,6 +541,137 @@ async fn ensure_loaded(
         });
     }
     Ok(())
+}
+
+async fn reload_table_from_kv(
+    table: &str,
+    state: &SharedState,
+    store: &SharedStore,
+) -> Result<u64, String> {
+    let kv = crate::store::get_or_create_kv(store, table)
+        .await
+        .map_err(|e| format!("load table: {e}"))?;
+    let entries = kv
+        .load_all()
+        .await
+        .map_err(|e| format!("load table: {e}"))?;
+    let max_rev = entries.iter().map(|e| e.revision).max().unwrap_or(0);
+
+    let mut s = state.borrow_mut();
+    let ts = s.table(table);
+    let existing_index_fields: Vec<String> = ts.indexes.keys().cloned().collect();
+    let existing_compound_defs: Vec<(String, Vec<String>)> = ts
+        .compound_indexes
+        .iter()
+        .map(|(name, idx)| (name.clone(), idx.fields.clone()))
+        .collect();
+    ts.data.clear();
+    ts.indexes.clear();
+    for field in existing_index_fields {
+        ts.indexes.insert(field, std::collections::BTreeMap::new());
+    }
+    ts.compound_indexes.clear();
+    for (name, fields) in existing_compound_defs {
+        ts.compound_indexes.insert(
+            name,
+            state::CompoundIndex {
+                fields,
+                data: std::collections::BTreeMap::new(),
+            },
+        );
+    }
+    for entry in entries {
+        ts.upsert(&entry.key, entry.value, entry.revision);
+    }
+    ts.loaded = true;
+    ts.note_applied_revision(max_rev);
+    Ok(max_rev)
+}
+
+async fn ensure_min_revision(
+    table: &str,
+    consistency: &Option<ConsistencyReq>,
+    state: &SharedState,
+    store: &SharedStore,
+) -> Result<(), String> {
+    ensure_loaded(table, state, store).await?;
+
+    let min_revision = consistency
+        .as_ref()
+        .and_then(|c| c.min_revision)
+        .unwrap_or(0);
+    if min_revision == 0 {
+        return Ok(());
+    }
+
+    let already_fresh = {
+        let s = state.borrow();
+        s.tables
+            .get(table)
+            .map_or(false, |t| t.applied_revision >= min_revision)
+    };
+    if already_fresh {
+        return Ok(());
+    }
+
+    for _ in 0..consistency_watcher_wait_steps() {
+        let (applied_revision, watching) = {
+            let s = state.borrow();
+            let t = s.tables.get(table);
+            (
+                t.map_or(0, |t| t.applied_revision),
+                t.map_or(false, |t| t.watching),
+            )
+        };
+
+        if applied_revision >= min_revision {
+            return Ok(());
+        }
+        if !watching {
+            break;
+        }
+
+        wasip3::clocks::monotonic_clock::wait_for(secs(
+            consistency_watcher_wait_step_secs(),
+        ))
+        .await;
+    }
+
+    let caught_up_after_wait = {
+        let s = state.borrow();
+        s.tables
+            .get(table)
+            .map_or(false, |t| t.applied_revision >= min_revision)
+    };
+    if caught_up_after_wait {
+        return Ok(());
+    }
+
+    reload_table_from_kv(table, state, store).await?;
+
+    let caught_up = {
+        let s = state.borrow();
+        s.tables
+            .get(table)
+            .map_or(false, |t| t.applied_revision >= min_revision)
+    };
+    if caught_up {
+        Ok(())
+    } else {
+        Err(format!(
+            "stale replica: table '{}' not caught up to required revision {}",
+            table, min_revision
+        ))
+    }
+}
+
+fn session_for_table(table: &str, revision: u64) -> Option<SessionToken> {
+    if revision == 0 {
+        return None;
+    }
+    let mut revisions = HashMap::new();
+    revisions.insert(table.to_string(), revision);
+    Some(SessionToken { revisions })
 }
 
 /// Background loop that watches a KV bucket for changes from other replicas
@@ -501,6 +713,7 @@ async fn run_table_watcher(
                 if !dominated {
                     ts.upsert(&entry.key, entry.value, entry.revision);
                 }
+                ts.note_applied_revision(entry.revision);
             }
             nats_wasi::kv::Operation::Delete | nats_wasi::kv::Operation::Purge => {
                 // Remove from cache. Check revision to avoid deleting a newer write.
@@ -511,6 +724,7 @@ async fn run_table_watcher(
                 if !dominated {
                     ts.remove(&entry.key);
                 }
+                ts.note_applied_revision(entry.revision);
             }
             // `Operation` is `#[non_exhaustive]` since nats-wasip3 0.7; ignore unknown ops.
             _ => {}
@@ -524,6 +738,7 @@ async fn run_table_watcher(
         let ts = s.table(table);
         ts.watching = false;
         ts.loaded = false;
+        ts.applied_revision = 0;
     }
     eprintln!("lattice-db: watcher stopped for table {table} — will reload on next request");
 }
@@ -536,7 +751,7 @@ async fn handle_get(
     payload: &[u8],
 ) -> Result<Vec<u8>, String> {
     let req: KeyReq = parse_req(payload)?;
-    ensure_loaded(&req.table, state, store).await?;
+    ensure_min_revision(&req.table, &req.consistency, state, store).await?;
 
     let s = state.borrow();
     let table = s.tables.get(&req.table).ok_or("table not loaded")?;
@@ -546,6 +761,7 @@ async fn handle_get(
         key: req.key,
         value: B64.encode(&row.value),
         revision: row.revision,
+        session: session_for_table(&req.table, row.revision),
     })
 }
 
@@ -594,7 +810,10 @@ async fn handle_put(
         Some(revision),
         instance,
     );
-    ok_json(&RevisionResp { revision })
+    ok_json(&RevisionResp {
+        revision,
+        session: session_for_table(&req.table, revision),
+    })
 }
 
 async fn handle_delete(
@@ -605,7 +824,7 @@ async fn handle_delete(
     instance: &str,
 ) -> Result<Vec<u8>, String> {
     let req: KeyReq = parse_req(payload)?;
-    ensure_loaded(&req.table, state, store).await?;
+    ensure_min_revision(&req.table, &req.consistency, state, store).await?;
 
     let kv = crate::store::get_or_create_kv(store, &req.table)
         .await
@@ -708,7 +927,7 @@ async fn handle_get_revision(
     payload: &[u8],
 ) -> Result<Vec<u8>, String> {
     let req: GetRevisionReq = parse_req(payload)?;
-    ensure_loaded(&req.table, state, store).await?;
+    ensure_min_revision(&req.table, &req.consistency, state, store).await?;
 
     let kv = crate::store::get_or_create_kv(store, &req.table)
         .await
@@ -795,7 +1014,10 @@ async fn handle_cas(
         Some(revision),
         instance,
     );
-    ok_json(&RevisionResp { revision })
+    ok_json(&RevisionResp {
+        revision,
+        session: session_for_table(&req.table, revision),
+    })
 }
 
 async fn handle_create(
@@ -846,7 +1068,10 @@ async fn handle_create(
         Some(revision),
         instance,
     );
-    ok_json(&RevisionResp { revision })
+    ok_json(&RevisionResp {
+        revision,
+        session: session_for_table(&req.table, revision),
+    })
 }
 
 async fn handle_exists(
@@ -855,7 +1080,7 @@ async fn handle_exists(
     payload: &[u8],
 ) -> Result<Vec<u8>, String> {
     let req: KeyReq = parse_req(payload)?;
-    ensure_loaded(&req.table, state, store).await?;
+    ensure_min_revision(&req.table, &req.consistency, state, store).await?;
 
     let exists = {
         let s = state.borrow();
@@ -873,7 +1098,7 @@ async fn handle_keys(
     payload: &[u8],
 ) -> Result<Vec<u8>, String> {
     let req: KeysReq = parse_req(payload)?;
-    ensure_loaded(&req.table, state, store).await?;
+    ensure_min_revision(&req.table, &req.consistency, state, store).await?;
 
     let s = state.borrow();
     let table = s.tables.get(&req.table);
@@ -901,7 +1126,7 @@ async fn handle_scan(
     payload: &[u8],
 ) -> Result<Vec<u8>, String> {
     let req: ScanReq = parse_req(payload)?;
-    ensure_loaded(&req.table, state, store).await?;
+    ensure_min_revision(&req.table, &req.consistency, state, store).await?;
 
     let s = state.borrow();
     let table = s.tables.get(&req.table);
@@ -975,6 +1200,7 @@ async fn handle_scan(
                 key: k,
                 value: B64.encode(&row.value),
                 revision: row.revision,
+                session: None,
             })
         })
         .collect();
@@ -991,7 +1217,7 @@ async fn handle_count(
     payload: &[u8],
 ) -> Result<Vec<u8>, String> {
     let req: CountReq = parse_req(payload)?;
-    ensure_loaded(&req.table, state, store).await?;
+    ensure_min_revision(&req.table, &req.consistency, state, store).await?;
 
     let s = state.borrow();
     let table = s.tables.get(&req.table);
@@ -1116,7 +1342,7 @@ async fn handle_batch_get(
     payload: &[u8],
 ) -> Result<Vec<u8>, String> {
     let req: BatchGetReq = parse_req(payload)?;
-    ensure_loaded(&req.table, state, store).await?;
+    ensure_min_revision(&req.table, &req.consistency, state, store).await?;
 
     let s = state.borrow();
     let table = s.tables.get(&req.table);
@@ -1209,7 +1435,11 @@ async fn handle_batch_put(
         });
     }
 
-    ok_json(&BatchPutResp { results })
+    let max_revision = results.iter().map(|r| r.revision).max().unwrap_or(0);
+    ok_json(&BatchPutResp {
+        results,
+        session: session_for_table(&req.table, max_revision),
+    })
 }
 
 // ── Aggregation ────────────────────────────────────────────────────
@@ -1220,7 +1450,7 @@ async fn handle_aggregate(
     payload: &[u8],
 ) -> Result<Vec<u8>, String> {
     let req: AggregateReq = parse_req(payload)?;
-    ensure_loaded(&req.table, state, store).await?;
+    ensure_min_revision(&req.table, &req.consistency, state, store).await?;
 
     let ops: Vec<state::AggOp> = req
         .ops

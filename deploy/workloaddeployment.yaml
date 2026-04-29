@@ -24,6 +24,8 @@ spec:
               NATS_DATA_URL: "__NATS_DATA_URL__"
               LDB_INSTANCE: "__LDB_INSTANCE__"
               LDB_DATA_INSTANCE: "__LDB_DATA_INSTANCE__"
+              LDB_CONSISTENCY_WATCHER_WAIT_STEPS: "2"
+              LDB_CONSISTENCY_WATCHER_WAIT_STEP_SECS: "1"
       hostInterfaces:
         # The service needs outgoing TCP to connect to NATS.
         - namespace: wasi
