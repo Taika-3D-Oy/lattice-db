@@ -76,6 +76,10 @@ Write responses may include:
 
 This enables read-your-write behavior even when traffic hops across app and storage replicas.
 
+When consistency is enabled, lattice-db derives catch-up freshness from KV stream sequence
+watermarks, not just the highest surviving row revision. This avoids false stale errors when
+the bucket has many delete/purge events (for example, high-churn expiring session keys).
+
 ## Instance isolation
 
 > **Note:** Throughout this README, `ldb` is the **default instance name** — the prefix used in all subject names, KV bucket names, and the WAL stream. It is not hardcoded; every occurrence of `ldb` in the examples above (`ldb.get`, `ldb-users`, `ldb-txn`, …) becomes your chosen name when you set `LDB_INSTANCE`.

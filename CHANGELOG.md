@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.6.1] - 2026-04-29
+
+### Fixed
+
+- **Consistency catch-up under TTL/tombstone churn**:
+  - Table hydration/reload now derives freshness from KV stream snapshot sequence (`last_seq`) instead of max surviving row revision.
+  - Prevents false `stale replica` failures when many intermediate messages are deletes/purges (common with expiring sessions).
+  - Watchers now start from the table's applied watermark, eliminating sequence gaps such as "loaded at rev 19 while bucket is at 44".
+
+### Changed
+
+- **Version Bumps**: Bumped all core crates to `1.6.1` (`storage-service`, `lattice-db-client`, `lattice-sql`, `lattice-sql-client`).
+
 ## [1.6.0] - 2026-04-29
 
 ### Added
