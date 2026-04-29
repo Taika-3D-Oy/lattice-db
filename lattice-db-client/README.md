@@ -17,8 +17,8 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-lattice-db-client = "1.0"
-nats-wasip3 = "0.7"
+lattice-db-client = "1.5"
+nats-wasip3 = "0.8"
 ```
 
 ```rust
@@ -66,6 +66,11 @@ db.transaction(vec![
 | `create_with_ttl` | Insert with an expiry (fails if key exists) |
 | `cas` | Compare-and-swap (optimistic concurrency) |
 | `cas_with_ttl` | Compare-and-swap with an expiry |
+| `cas_delete` | CAS delete — only if revision matches |
+| `purge` | Remove all revisions of a key |
+| `purge_with_ttl` | Purge with an expiring tombstone |
+| `purge_expect_revision` | CAS purge — only if revision matches |
+| `get_revision` | Fetch entry at a specific revision (incl. tombstones) |
 | `scan` | Query with filters, sorting, pagination |
 | `count` | Count rows matching optional filters |
 | `aggregate` | Sum, avg, min, max, group_by |

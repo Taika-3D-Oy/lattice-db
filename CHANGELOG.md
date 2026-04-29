@@ -1,5 +1,23 @@
 # Changelog
 
+## [1.5.0] - 2026-04-29
+
+### Added
+
+- **CAS delete** (`ldb.cas_delete`): Tombstone a key only if the current revision matches.
+  Prevents race conditions where one client deletes data that another client has since updated.
+  Client: `LatticeDb::cas_delete(table, key, revision)`.
+- **Purge** (`ldb.purge`): Remove all revisions of a key (full history wipe, not just tombstone).
+  Supports optional CAS via `revision` and expiring tombstones via `ttl_seconds`.
+  Client: `purge()`, `purge_with_ttl()`, `purge_expect_revision()`, `purge_expect_revision_with_ttl()`.
+- **Revision lookup** (`ldb.get_revision`): Fetch the entry at a specific stream sequence,
+  including delete and purge tombstones. Useful for audit trails and conflict debugging.
+  Client: `LatticeDb::get_revision(table, key, revision)` → `RevisionEntry`.
+
+### Changed
+
+- **Dependency**: `nats-wasip3` minimum version bumped from `0.8.0` to `0.8.1` (new KV APIs).
+
 ## [1.4.0] - 2026-04-28
 
 ### Added

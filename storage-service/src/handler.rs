@@ -15,6 +15,9 @@
 //! ldb.index.create    {table, field}                   → {}
 //! ldb.index.drop      {table, field}                   → {}
 //! ldb.index.list      {table}                          → {indexes}
+//! ldb.cas_delete       {table, key, revision}           → {}
+//! ldb.purge            {table, key, revision?, ttl_seconds?} → {}
+//! ldb.get_revision     {table, key, revision}           → {key, value, revision, operation}
 //! ldb.txn             {ops: [{op, table, key, value?}]} → {ok, results}
 //! ```
 //!
@@ -86,6 +89,30 @@ struct CasReq {
     revision: u64,
     #[serde(default)]
     ttl_seconds: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct CasDeleteReq {
+    table: String,
+    key: String,
+    revision: u64,
+}
+
+#[derive(Deserialize)]
+struct PurgeReq {
+    table: String,
+    key: String,
+    #[serde(default)]
+    revision: Option<u64>,
+    #[serde(default)]
+    ttl_seconds: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct GetRevisionReq {
+    table: String,
+    key: String,
+    revision: u64,
 }
 
 #[derive(Deserialize)]
@@ -214,6 +241,14 @@ struct ExistsResp {
 }
 
 #[derive(Serialize)]
+struct RevisionEntryResp {
+    key: String,
+    value: String, // base64
+    revision: u64,
+    operation: String, // "put", "delete", "purge"
+}
+
+#[derive(Serialize)]
 struct KeysResp {
     keys: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -333,6 +368,9 @@ pub async fn handle(
         "put" => handle_put(client, state, store, &payload, instance).await,
         "delete" => handle_delete(client, state, store, &payload, instance).await,
         "cas" => handle_cas(client, state, store, &payload, instance).await,
+        "cas_delete" => handle_cas_delete(client, state, store, &payload, instance).await,
+        "purge" => handle_purge(client, state, store, &payload, instance).await,
+        "get_revision" => handle_get_revision(state, store, &payload).await,
         "create" => handle_create(client, state, store, &payload, instance).await,
         "exists" => handle_exists(state, store, &payload).await,
         "keys" => handle_keys(state, store, &payload).await,
@@ -587,6 +625,114 @@ async fn handle_delete(
         instance,
     );
     ok_json(&EmptyResp {})
+}
+
+async fn handle_cas_delete(
+    client: &Client,
+    state: &SharedState,
+    store: &SharedStore,
+    payload: &[u8],
+    instance: &str,
+) -> Result<Vec<u8>, String> {
+    let req: CasDeleteReq = parse_req(payload)?;
+    ensure_loaded(&req.table, state, store).await?;
+
+    let kv = crate::store::get_or_create_kv(store, &req.table)
+        .await
+        .map_err(|e| format!("{e}"))?;
+    // CAS delete — only tombstone if the current revision matches.
+    match kv.cas_delete(&req.key, req.revision).await {
+        Ok(()) => {}
+        Err(e) => {
+            // On CAS failure, re-fetch the winning value so the client's next
+            // retry sees the current revision immediately.
+            if let Ok(Some(current)) = kv.get(&req.key).await {
+                state.borrow_mut().table(&req.table).upsert(
+                    &req.key,
+                    current.value,
+                    current.revision,
+                );
+            }
+            return Err(format!("{e}"));
+        }
+    }
+
+    state.borrow_mut().table(&req.table).remove(&req.key);
+
+    publish_change(client, "delete", &req.table, &req.key, None, None, instance);
+    ok_json(&EmptyResp {})
+}
+
+async fn handle_purge(
+    client: &Client,
+    state: &SharedState,
+    store: &SharedStore,
+    payload: &[u8],
+    instance: &str,
+) -> Result<Vec<u8>, String> {
+    let req: PurgeReq = parse_req(payload)?;
+    ensure_loaded(&req.table, state, store).await?;
+
+    let kv = crate::store::get_or_create_kv(store, &req.table)
+        .await
+        .map_err(|e| format!("{e}"))?;
+
+    match (req.revision, req.ttl_seconds) {
+        (Some(rev), Some(ttl)) => kv
+            .purge_expect_revision_with_ttl(&req.key, rev, secs(ttl))
+            .await
+            .map_err(|e| format!("{e}"))?,
+        (Some(rev), None) => kv
+            .purge_expect_revision(&req.key, rev)
+            .await
+            .map_err(|e| format!("{e}"))?,
+        (None, Some(ttl)) => kv
+            .purge_with_ttl(&req.key, secs(ttl))
+            .await
+            .map_err(|e| format!("{e}"))?,
+        (None, None) => kv
+            .purge(&req.key)
+            .await
+            .map_err(|e| format!("{e}"))?,
+    };
+
+    state.borrow_mut().table(&req.table).remove(&req.key);
+
+    publish_change(client, "purge", &req.table, &req.key, None, None, instance);
+    ok_json(&EmptyResp {})
+}
+
+async fn handle_get_revision(
+    state: &SharedState,
+    store: &SharedStore,
+    payload: &[u8],
+) -> Result<Vec<u8>, String> {
+    let req: GetRevisionReq = parse_req(payload)?;
+    ensure_loaded(&req.table, state, store).await?;
+
+    let kv = crate::store::get_or_create_kv(store, &req.table)
+        .await
+        .map_err(|e| format!("{e}"))?;
+
+    let entry = kv
+        .entry_for_revision(&req.key, req.revision)
+        .await
+        .map_err(|e| format!("{e}"))?
+        .ok_or("not found")?;
+
+    let operation = match entry.operation {
+        nats_wasi::kv::Operation::Put => "put",
+        nats_wasi::kv::Operation::Delete => "delete",
+        nats_wasi::kv::Operation::Purge => "purge",
+        _ => "unknown",
+    };
+
+    ok_json(&RevisionEntryResp {
+        key: entry.key,
+        value: B64.encode(&entry.value),
+        revision: entry.revision,
+        operation: operation.to_string(),
+    })
 }
 
 async fn handle_cas(

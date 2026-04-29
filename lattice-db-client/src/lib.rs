@@ -92,6 +92,18 @@ pub struct Row {
     pub revision: u64,
 }
 
+/// An entry at a specific revision, including tombstones.
+/// Returned by [`LatticeDb::get_revision`].
+#[derive(Debug, Clone)]
+pub struct RevisionEntry {
+    pub key: String,
+    pub value: Vec<u8>,
+    /// The NATS stream sequence (revision) of this entry.
+    pub revision: u64,
+    /// The operation that produced this entry: `"put"`, `"delete"`, or `"purge"`.
+    pub operation: String,
+}
+
 /// A page of keys from the keys operation.
 #[derive(Debug, Clone)]
 pub struct KeysPage {
@@ -294,6 +306,30 @@ struct CasReq<'a> {
 }
 
 #[derive(Serialize)]
+struct CasDeleteReqW<'a> {
+    table: &'a str,
+    key: &'a str,
+    revision: u64,
+}
+
+#[derive(Serialize)]
+struct PurgeReqW<'a> {
+    table: &'a str,
+    key: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    revision: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ttl_seconds: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct GetRevisionReqW<'a> {
+    table: &'a str,
+    key: &'a str,
+    revision: u64,
+}
+
+#[derive(Serialize)]
 struct TableReq<'a> { table: &'a str }
 
 #[derive(Serialize)]
@@ -383,6 +419,7 @@ struct SchemaSetReqW<'a> { table: &'a str, schema: &'a serde_json::Value }
 #[derive(Deserialize)] struct TxnR { ok: bool, results: Vec<TxnOpResult> }
 #[derive(Deserialize)] struct AggR { groups: Vec<AggGroup> }
 #[derive(Deserialize)] struct SchemaR { schema: serde_json::Value }
+#[derive(Deserialize)] struct RevisionEntryR { key: String, value: String, revision: u64, operation: String }
 #[derive(Deserialize)] struct ErrorR { error: Option<String> }
 
 // ── Client ─────────────────────────────────────────────────────────
@@ -509,6 +546,67 @@ impl LatticeDb {
             table, key, value: B64.encode(value), revision, ttl_seconds: Some(ttl_seconds),
         }).await?;
         Ok(resp.revision)
+    }
+
+    /// Compare-and-swap delete: tombstone a key only if the current revision matches.
+    ///
+    /// Prevents race conditions where one client deletes data that another
+    /// client has since updated.
+    pub async fn cas_delete(&self, table: &str, key: &str, revision: u64) -> Result<(), Error> {
+        let _: serde_json::Value = self.req(&self.subj("cas_delete"), &CasDeleteReqW {
+            table, key, revision,
+        }).await?;
+        Ok(())
+    }
+
+    /// Purge a key — remove all revisions (not just tombstone).
+    ///
+    /// Unlike [`LatticeDb::delete`], this removes all history for the key.
+    pub async fn purge(&self, table: &str, key: &str) -> Result<(), Error> {
+        let _: serde_json::Value = self.req(&self.subj("purge"), &PurgeReqW {
+            table, key, revision: None, ttl_seconds: None,
+        }).await?;
+        Ok(())
+    }
+
+    /// Purge a key with an expiring tombstone. The tombstone itself expires
+    /// after `ttl_seconds`.
+    pub async fn purge_with_ttl(&self, table: &str, key: &str, ttl_seconds: u64) -> Result<(), Error> {
+        let _: serde_json::Value = self.req(&self.subj("purge"), &PurgeReqW {
+            table, key, revision: None, ttl_seconds: Some(ttl_seconds),
+        }).await?;
+        Ok(())
+    }
+
+    /// Compare-and-swap purge: remove all revisions only if the current
+    /// revision matches.
+    pub async fn purge_expect_revision(&self, table: &str, key: &str, revision: u64) -> Result<(), Error> {
+        let _: serde_json::Value = self.req(&self.subj("purge"), &PurgeReqW {
+            table, key, revision: Some(revision), ttl_seconds: None,
+        }).await?;
+        Ok(())
+    }
+
+    /// Compare-and-swap purge with an expiring tombstone.
+    pub async fn purge_expect_revision_with_ttl(&self, table: &str, key: &str, revision: u64, ttl_seconds: u64) -> Result<(), Error> {
+        let _: serde_json::Value = self.req(&self.subj("purge"), &PurgeReqW {
+            table, key, revision: Some(revision), ttl_seconds: Some(ttl_seconds),
+        }).await?;
+        Ok(())
+    }
+
+    /// Fetch the entry at a specific stream sequence (revision), including
+    /// delete and purge tombstones. Useful for history inspection and auditing.
+    pub async fn get_revision(&self, table: &str, key: &str, revision: u64) -> Result<RevisionEntry, Error> {
+        let resp: RevisionEntryR = self.req(&self.subj("get_revision"), &GetRevisionReqW {
+            table, key, revision,
+        }).await?;
+        Ok(RevisionEntry {
+            key: resp.key,
+            value: B64.decode(&resp.value).map_err(|e| Error::Base64(e.to_string()))?,
+            revision: resp.revision,
+            operation: resp.operation,
+        })
     }
 
     /// Check if a key exists.

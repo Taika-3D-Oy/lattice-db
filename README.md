@@ -44,6 +44,9 @@ All requests are NATS request/reply on `ldb.{op}`. Bodies are JSON; binary value
 | `ldb.put` / `ldb.create` | `{table, key, value, ttl_seconds?}` |
 | `ldb.cas` | `{table, key, value, revision, ttl_seconds?}` |
 | `ldb.delete` | `{table, key}` |
+| `ldb.cas_delete` | `{table, key, revision}` |
+| `ldb.purge` | `{table, key, revision?, ttl_seconds?}` |
+| `ldb.get_revision` | `{table, key, revision}` — includes delete/purge tombstones |
 | `ldb.batch.get` / `ldb.batch.put` | `{table, keys: [...]}` / `{table, entries: [...]}` |
 | `ldb.scan` / `ldb.count` | `{table, filters, order_by?, limit?, offset?, key_prefix?}` |
 | `ldb.aggregate` | `{table, filters, group_by?, ops: [{fn, field?}]}` (`count`/`sum`/`avg`/`min`/`max`) |
