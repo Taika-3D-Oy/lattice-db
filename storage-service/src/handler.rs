@@ -509,26 +509,22 @@ async fn ensure_loaded(
         .map_err(|e| format!("load table: {e}"))?;
 
     let max_rev = if needs_load {
-        let entries = kv
-            .load_all()
-            .await
-            .map_err(|e| format!("load table: {e}"))?;
-        let max_rev = entries.iter().map(|e| e.revision).max().unwrap_or(0);
+        let (entries, snapshot_last_seq) = load_table_snapshot(&kv).await?;
         let mut s = state.borrow_mut();
         let ts = s.table(table);
-        for entry in entries {
-            ts.upsert(&entry.key, entry.value, entry.revision);
+        for (key, value, revision) in entries {
+            ts.upsert(&key, value, revision);
         }
         ts.loaded = true;
-        ts.note_applied_revision(max_rev);
-        max_rev
+        ts.note_applied_revision(snapshot_last_seq);
+        snapshot_last_seq
     } else {
-        // Already loaded — start the watcher from the highest revision we hold.
+        // Already loaded — start the watcher from the table's applied watermark.
         state
             .borrow()
             .tables
             .get(table)
-            .map(|t| t.data.values().map(|r| r.revision).max().unwrap_or(0))
+            .map(|t| t.applied_revision)
             .unwrap_or(0)
     };
 
@@ -543,6 +539,54 @@ async fn ensure_loaded(
     Ok(())
 }
 
+async fn load_table_snapshot(
+    kv: &nats_wasi::kv::KeyValue,
+) -> Result<(Vec<(String, Vec<u8>, u64)>, u64), String> {
+    let stream_name = format!("KV_{}", kv.bucket());
+    let info = match kv.jetstream().stream_info(&stream_name).await {
+        Ok(info) => info,
+        Err(nats_wasi::Error::JetStream { code: 404, .. }) => return Ok((Vec::new(), 0)),
+        Err(e) => return Err(format!("load table: {e}")),
+    };
+
+    if info.state.messages == 0 {
+        return Ok((Vec::new(), info.state.last_seq));
+    }
+
+    let prefix = format!("$KV.{}.", kv.bucket());
+    let first = info.state.first_seq;
+    let last = info.state.last_seq;
+    let mut latest: HashMap<String, (u64, Vec<u8>, bool, Option<String>)> = HashMap::new();
+
+    for seq in first..=last {
+        let msg = match kv.jetstream().stream_get_msg(&stream_name, seq).await {
+            Ok(Some(m)) => m,
+            Ok(None) => continue,
+            Err(_) => continue,
+        };
+
+        let Some(key) = msg.subject.strip_prefix(&prefix) else {
+            continue;
+        };
+
+        let is_deleted = msg
+            .headers_b64
+            .as_ref()
+            .and_then(|h| B64.decode(h).ok())
+            .is_some_and(|bytes| bytes.windows(12).any(|w| w == b"KV-Operation"));
+
+        latest.insert(key.to_string(), (msg.seq, msg.data, is_deleted, msg.time));
+    }
+
+    let entries = latest
+        .into_iter()
+        .filter(|(_, (_, _, deleted, _))| !*deleted)
+        .map(|(key, (revision, value, _, _))| (key, value, revision))
+        .collect();
+
+    Ok((entries, last))
+}
+
 async fn reload_table_from_kv(
     table: &str,
     state: &SharedState,
@@ -551,11 +595,7 @@ async fn reload_table_from_kv(
     let kv = crate::store::get_or_create_kv(store, table)
         .await
         .map_err(|e| format!("load table: {e}"))?;
-    let entries = kv
-        .load_all()
-        .await
-        .map_err(|e| format!("load table: {e}"))?;
-    let max_rev = entries.iter().map(|e| e.revision).max().unwrap_or(0);
+    let (entries, snapshot_last_seq) = load_table_snapshot(&kv).await?;
 
     let mut s = state.borrow_mut();
     let ts = s.table(table);
@@ -580,12 +620,12 @@ async fn reload_table_from_kv(
             },
         );
     }
-    for entry in entries {
-        ts.upsert(&entry.key, entry.value, entry.revision);
+    for (key, value, revision) in entries {
+        ts.upsert(&key, value, revision);
     }
     ts.loaded = true;
-    ts.note_applied_revision(max_rev);
-    Ok(max_rev)
+    ts.note_applied_revision(snapshot_last_seq);
+    Ok(snapshot_last_seq)
 }
 
 async fn ensure_min_revision(
