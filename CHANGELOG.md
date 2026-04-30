@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.6.6] - 2026-04-30
+
+### Fixed
+
+- **nats-wasip3 0.9.1**: Critical bug fix release — upgraded from 0.9.0 across all four crates.
+
 ## [1.6.5] - 2026-04-30
 
 ### Changed
