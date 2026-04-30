@@ -7,6 +7,7 @@ mod handler;
 mod log;
 mod state;
 mod store;
+mod tcp_server;
 mod tests;
 mod txn;
 
@@ -320,6 +321,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             });
         }
     }
+
+    // Start TCP listener for localhost (workload-internal) access.
+    tcp_server::start(
+        msg_client.clone(),
+        js.clone(),
+        config.clone(),
+        shared_state.clone(),
+        shared_store.clone(),
+    );
 
     // Subscribe to all lattice-db operations (queue group for scaling).
     let sub_subject = format!("{instance}.>");

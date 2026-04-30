@@ -823,7 +823,7 @@ async fn run_table_watcher(
 
 // ── Operation handlers ─────────────────────────────────────────────
 
-async fn handle_get(
+pub(crate) async fn handle_get(
     state: &SharedState,
     store: &SharedStore,
     payload: &[u8],
@@ -843,7 +843,7 @@ async fn handle_get(
     })
 }
 
-async fn handle_put(
+pub(crate) async fn handle_put(
     client: &Client,
     state: &SharedState,
     store: &SharedStore,
@@ -894,7 +894,7 @@ async fn handle_put(
     })
 }
 
-async fn handle_delete(
+pub(crate) async fn handle_delete(
     client: &Client,
     state: &SharedState,
     store: &SharedStore,
@@ -916,7 +916,7 @@ async fn handle_delete(
     ok_json(&EmptyResp {})
 }
 
-async fn handle_cas_delete(
+pub(crate) async fn handle_cas_delete(
     client: &Client,
     state: &SharedState,
     store: &SharedStore,
@@ -952,7 +952,7 @@ async fn handle_cas_delete(
     ok_json(&EmptyResp {})
 }
 
-async fn handle_purge(
+pub(crate) async fn handle_purge(
     client: &Client,
     state: &SharedState,
     store: &SharedStore,
@@ -988,7 +988,7 @@ async fn handle_purge(
     ok_json(&EmptyResp {})
 }
 
-async fn handle_get_revision(
+pub(crate) async fn handle_get_revision(
     state: &SharedState,
     store: &SharedStore,
     payload: &[u8],
@@ -1021,7 +1021,7 @@ async fn handle_get_revision(
     })
 }
 
-async fn handle_cas(
+pub(crate) async fn handle_cas(
     client: &Client,
     state: &SharedState,
     store: &SharedStore,
@@ -1087,7 +1087,7 @@ async fn handle_cas(
     })
 }
 
-async fn handle_create(
+pub(crate) async fn handle_create(
     client: &Client,
     state: &SharedState,
     store: &SharedStore,
@@ -1141,7 +1141,7 @@ async fn handle_create(
     })
 }
 
-async fn handle_exists(
+pub(crate) async fn handle_exists(
     state: &SharedState,
     store: &SharedStore,
     payload: &[u8],
@@ -1159,7 +1159,7 @@ async fn handle_exists(
     ok_json(&ExistsResp { exists })
 }
 
-async fn handle_keys(
+pub(crate) async fn handle_keys(
     state: &SharedState,
     store: &SharedStore,
     payload: &[u8],
@@ -1187,7 +1187,7 @@ async fn handle_keys(
     })
 }
 
-async fn handle_scan(
+pub(crate) async fn handle_scan(
     state: &SharedState,
     store: &SharedStore,
     payload: &[u8],
@@ -1278,7 +1278,7 @@ async fn handle_scan(
     })
 }
 
-async fn handle_count(
+pub(crate) async fn handle_count(
     state: &SharedState,
     store: &SharedStore,
     payload: &[u8],
@@ -1306,7 +1306,7 @@ async fn handle_count(
     ok_json(&CountResp { count })
 }
 
-async fn handle_index_create(
+pub(crate) async fn handle_index_create(
     state: &SharedState,
     store: &SharedStore,
     payload: &[u8],
@@ -1355,7 +1355,7 @@ async fn handle_index_create(
     ok_json(&EmptyResp {})
 }
 
-async fn handle_index_drop(
+pub(crate) async fn handle_index_drop(
     state: &SharedState,
     store: &SharedStore,
     payload: &[u8],
@@ -1377,7 +1377,7 @@ async fn handle_index_drop(
     ok_json(&EmptyResp {})
 }
 
-fn handle_index_list(state: &SharedState, payload: &[u8]) -> Result<Vec<u8>, String> {
+pub(crate) fn handle_index_list(state: &SharedState, payload: &[u8]) -> Result<Vec<u8>, String> {
     let req: TableReq = parse_req(payload)?;
     let s = state.borrow();
     let mut indexes: Vec<String> = s.tables.get(&req.table).map_or_else(Vec::new, |t| {
@@ -1389,7 +1389,7 @@ fn handle_index_list(state: &SharedState, payload: &[u8]) -> Result<Vec<u8>, Str
     ok_json(&IndexesResp { indexes })
 }
 
-async fn handle_txn(
+pub(crate) async fn handle_txn(
     js: &JetStream,
     state: &SharedState,
     store: &SharedStore,
@@ -1403,7 +1403,7 @@ async fn handle_txn(
 
 // ── Batch operations ───────────────────────────────────────────────
 
-async fn handle_batch_get(
+pub(crate) async fn handle_batch_get(
     state: &SharedState,
     store: &SharedStore,
     payload: &[u8],
@@ -1435,7 +1435,7 @@ async fn handle_batch_get(
     ok_json(&BatchGetResp { results })
 }
 
-async fn handle_batch_put(
+pub(crate) async fn handle_batch_put(
     client: &Client,
     state: &SharedState,
     store: &SharedStore,
@@ -1511,7 +1511,7 @@ async fn handle_batch_put(
 
 // ── Aggregation ────────────────────────────────────────────────────
 
-async fn handle_aggregate(
+pub(crate) async fn handle_aggregate(
     state: &SharedState,
     store: &SharedStore,
     payload: &[u8],
@@ -1540,7 +1540,7 @@ async fn handle_aggregate(
 
 // ── Schema management ──────────────────────────────────────────────
 
-async fn handle_schema_set(
+pub(crate) async fn handle_schema_set(
     state: &SharedState,
     store: &SharedStore,
     payload: &[u8],
@@ -1563,7 +1563,7 @@ async fn handle_schema_set(
     ok_json(&EmptyResp {})
 }
 
-fn handle_schema_get(state: &SharedState, payload: &[u8]) -> Result<Vec<u8>, String> {
+pub(crate) fn handle_schema_get(state: &SharedState, payload: &[u8]) -> Result<Vec<u8>, String> {
     let req: TableReq = parse_req(payload)?;
     let s = state.borrow();
     let schema = s
@@ -1574,7 +1574,7 @@ fn handle_schema_get(state: &SharedState, payload: &[u8]) -> Result<Vec<u8>, Str
     ok_json(&SchemaResp { schema })
 }
 
-async fn handle_schema_delete(
+pub(crate) async fn handle_schema_delete(
     state: &SharedState,
     store: &SharedStore,
     payload: &[u8],
@@ -1672,7 +1672,7 @@ pub(crate) fn validate_write_bounds(table: &str, key: &str, value: &[u8]) -> Res
 /// Check auth token in the request payload.
 ///
 /// S-03: uses constant-time comparison to prevent timing-based token oracle attacks.
-fn check_auth(payload: &[u8], expected: &str) -> Result<(), String> {
+pub(crate) fn check_auth(payload: &[u8], expected: &str) -> Result<(), String> {
     let v: serde_json::Value =
         serde_json::from_slice(payload).map_err(|_| "unauthorized".to_string())?;
     let provided = v.get("_auth").and_then(|v| v.as_str()).unwrap_or("");
