@@ -542,49 +542,20 @@ async fn ensure_loaded(
 async fn load_table_snapshot(
     kv: &nats_wasi::kv::KeyValue,
 ) -> Result<(Vec<(String, Vec<u8>, u64)>, u64), String> {
-    let stream_name = format!("KV_{}", kv.bucket());
-    let info = match kv.jetstream().stream_info(&stream_name).await {
-        Ok(info) => info,
-        Err(nats_wasi::Error::JetStream { code: 404, .. }) => return Ok((Vec::new(), 0)),
-        Err(e) => return Err(format!("load table: {e}")),
-    };
+    // Use status() to get the authoritative last_seq for consistency watermarks.
+    let status = kv.status().await.map_err(|e| format!("load table: {e}"))?;
+    let last_seq = status.last_seq;
 
-    if info.state.messages == 0 {
-        return Ok((Vec::new(), info.state.last_seq));
-    }
+    // Use the consumer-based load_all (nats-wasip3 ≥ 0.8.2) which fetches in
+    // batches using DeliverPolicy::LastPerSubject — O(keys) not O(stream_seq).
+    let raw_entries = kv.load_all().await.map_err(|e| format!("load table: {e}"))?;
 
-    let prefix = format!("$KV.{}.", kv.bucket());
-    let first = info.state.first_seq;
-    let last = info.state.last_seq;
-    let mut latest: HashMap<String, (u64, Vec<u8>, bool, Option<String>)> = HashMap::new();
-
-    for seq in first..=last {
-        let msg = match kv.jetstream().stream_get_msg(&stream_name, seq).await {
-            Ok(Some(m)) => m,
-            Ok(None) => continue,
-            Err(_) => continue,
-        };
-
-        let Some(key) = msg.subject.strip_prefix(&prefix) else {
-            continue;
-        };
-
-        let is_deleted = msg
-            .headers_b64
-            .as_ref()
-            .and_then(|h| B64.decode(h).ok())
-            .is_some_and(|bytes| bytes.windows(12).any(|w| w == b"KV-Operation"));
-
-        latest.insert(key.to_string(), (msg.seq, msg.data, is_deleted, msg.time));
-    }
-
-    let entries = latest
+    let entries = raw_entries
         .into_iter()
-        .filter(|(_, (_, _, deleted, _))| !*deleted)
-        .map(|(key, (revision, value, _, _))| (key, value, revision))
+        .map(|e| (e.key, e.value, e.revision))
         .collect();
 
-    Ok((entries, last))
+    Ok((entries, last_seq))
 }
 
 async fn reload_table_from_kv(

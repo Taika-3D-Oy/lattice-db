@@ -1,6 +1,6 @@
 [package]
 name = "lattice-sql-client"
-version = "1.6.2"
+version = "1.6.3"
 edition = "2021"
 description = "Typed Rust client SDK for lattice-sql — SQL frontend for lattice-db"
 license = "Apache-2.0"

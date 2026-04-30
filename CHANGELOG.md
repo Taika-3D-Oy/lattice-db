@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.6.3] - 2026-04-30
+
+### Fixed
+
+- **Cold table load performance**: Replaced the sequential per-sequence `stream_get_msg` loop in
+  `load_table_snapshot` with the consumer-based `kv.load_all()` from nats-wasip3 0.8.2.
+  Uses `DeliverPolicy::LastPerSubject` with batch fetch — O(keys) instead of O(stream_seq).
+  Eliminates multi-second cold-load latency on buckets with high TTL churn (e.g. `lid-sessions`
+  with 8 live keys but 560 total sequence entries took ~4s, now <50ms).
+
 ## [1.6.2]
 
 ### Changed
