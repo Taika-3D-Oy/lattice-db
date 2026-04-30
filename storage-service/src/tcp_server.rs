@@ -8,9 +8,7 @@
 //! This allows co-located components to bypass NATS and talk directly to
 //! the in-memory cache via virtual pipes (sub-millisecond latency).
 
-use wasip3::sockets::types::{
-    IpAddressFamily, IpSocketAddress, Ipv4SocketAddress, TcpSocket,
-};
+use wasip3::sockets::types::{IpAddressFamily, IpSocketAddress, Ipv4SocketAddress, TcpSocket};
 use wasip3::wit_stream;
 use wit_bindgen::{StreamReader, StreamResult, StreamWriter};
 
@@ -51,8 +49,8 @@ async fn run_listener(
     state: SharedState,
     store: SharedStore,
 ) -> Result<(), String> {
-    let socket = TcpSocket::create(IpAddressFamily::Ipv4)
-        .map_err(|e| format!("tcp create: {e:?}"))?;
+    let socket =
+        TcpSocket::create(IpAddressFamily::Ipv4).map_err(|e| format!("tcp create: {e:?}"))?;
 
     let addr = IpSocketAddress::Ipv4(Ipv4SocketAddress {
         port,
@@ -60,9 +58,8 @@ async fn run_listener(
     });
     socket.bind(addr).map_err(|e| format!("tcp bind: {e:?}"))?;
 
-    let mut incoming: StreamReader<TcpSocket> = socket
-        .listen()
-        .map_err(|e| format!("tcp listen: {e:?}"))?;
+    let mut incoming: StreamReader<TcpSocket> =
+        socket.listen().map_err(|e| format!("tcp listen: {e:?}"))?;
 
     eprintln!("lattice-db: tcp listening on 127.0.0.1:{port}");
 
@@ -194,7 +191,9 @@ async fn dispatch(
         "index.create" => handler::handle_index_create(state, store, payload).await,
         "index.drop" => handler::handle_index_drop(state, store, payload).await,
         "index.list" => handler::handle_index_list(state, payload),
-        "txn" => handler::handle_txn(js, state, store, payload, config.data_instance.as_str()).await,
+        "txn" => {
+            handler::handle_txn(js, state, store, payload, config.data_instance.as_str()).await
+        }
         "batch.get" => handler::handle_batch_get(state, store, payload).await,
         "batch.put" => handler::handle_batch_put(client, state, store, payload, instance).await,
         "aggregate" => handler::handle_aggregate(state, store, payload).await,

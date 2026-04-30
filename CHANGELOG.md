@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.7.0] - 2026-04-30
+
+### Added
+
+- **TCP listener for co-located workload access**: New `tcp_server` module listens on
+  `127.0.0.1:4080` (configurable via `LDB_TCP_PORT` env var) alongside the existing NATS
+  subscription loop. Wire protocol uses 4-byte BE length prefix + JSON body with `_op` field.
+  Enables wasmCloud components in the same workload to bypass NATS and talk directly to the
+  in-memory cache via virtual pipes (sub-ms latency).
+- Handler functions made `pub(crate)` for TCP server access.
+
 ## [1.6.6] - 2026-04-30
 
 ### Fixed
