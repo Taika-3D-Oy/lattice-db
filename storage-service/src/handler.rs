@@ -491,42 +491,103 @@ async fn ensure_loaded(
     // They are tracked separately because txn::recover() can pre-load tables
     // before the dispatcher ever runs ensure_loaded — in that case `loaded`
     // is already true but no watcher exists yet.
-    let (needs_load, needs_watcher) = {
-        let s = state.borrow();
-        let t = s.tables.get(table);
-        (
-            !t.map_or(false, |t| t.loaded),
-            !t.map_or(false, |t| t.watching),
-        )
+    //
+    // The `loading` flag prevents concurrent tasks from racing through the
+    // async load path and spawning duplicate watchers.
+    let (needs_load, needs_watcher, is_loading) = {
+        let mut s = state.borrow_mut();
+        let t = s.table(table);
+        let already_loaded = t.loaded;
+        let already_watching = t.watching;
+        let currently_loading = t.loading;
+        let needs_load = !already_loaded && !currently_loading;
+        let needs_watcher = !already_watching;
+        if needs_load {
+            t.loading = true;
+        }
+        (needs_load, needs_watcher, currently_loading)
     };
 
     if !needs_load && !needs_watcher {
+        if is_loading {
+            // Another task is currently loading this table — wait for it.
+            loop {
+                let done = {
+                    let s = state.borrow();
+                    s.tables.get(table).map_or(true, |t| t.loaded || !t.loading)
+                };
+                if done {
+                    break;
+                }
+                wasip3::clocks::monotonic_clock::wait_for(1_000_000).await; // 1ms yield
+            }
+        }
         return Ok(());
     }
 
-    let kv = crate::store::get_or_create_kv(store, table)
-        .await
-        .map_err(|e| format!("load table: {e}"))?;
-
-    let max_rev = if needs_load {
-        let (entries, snapshot_last_seq) = load_table_snapshot(&kv).await?;
-        let mut s = state.borrow_mut();
-        let ts = s.table(table);
-        for (key, value, revision) in entries {
-            ts.upsert(&key, value, revision);
-        }
-        ts.loaded = true;
-        ts.note_applied_revision(snapshot_last_seq);
-        snapshot_last_seq
-    } else {
-        // Already loaded — start the watcher from the table's applied watermark.
-        state
+    // If we only need a watcher (table already loaded by txn recovery), we
+    // still need a KV handle but skip the snapshot load.
+    if !needs_load && needs_watcher {
+        let kv = crate::store::get_or_create_kv(store, table)
+            .await
+            .map_err(|e| format!("load table: {e}"))?;
+        let max_rev = state
             .borrow()
             .tables
             .get(table)
             .map(|t| t.applied_revision)
-            .unwrap_or(0)
+            .unwrap_or(0);
+        state.borrow_mut().table(table).watching = true;
+        let watch_state = state.clone();
+        let table_name = table.to_string();
+        wit_bindgen::spawn(async move {
+            run_table_watcher(kv, &table_name, &watch_state, max_rev).await;
+        });
+        return Ok(());
+    }
+
+    // Also need to wait if another task is loading (and we need a watcher).
+    if is_loading {
+        loop {
+            let done = {
+                let s = state.borrow();
+                s.tables.get(table).map_or(true, |t| t.loaded || !t.loading)
+            };
+            if done {
+                break;
+            }
+            wasip3::clocks::monotonic_clock::wait_for(1_000_000).await; // 1ms yield
+        }
+        return Ok(());
+    }
+
+    let kv = match crate::store::get_or_create_kv(store, table).await {
+        Ok(kv) => kv,
+        Err(e) => {
+            // Release loading flag on failure.
+            state.borrow_mut().table(table).loading = false;
+            return Err(format!("load table: {e}"));
+        }
     };
+
+    let snapshot = load_table_snapshot(&kv).await;
+    let (entries, snapshot_last_seq) = match snapshot {
+        Ok(v) => v,
+        Err(e) => {
+            state.borrow_mut().table(table).loading = false;
+            return Err(e);
+        }
+    };
+    let mut s = state.borrow_mut();
+    let ts = s.table(table);
+    for (key, value, revision) in entries {
+        ts.upsert(&key, value, revision);
+    }
+    ts.loaded = true;
+    ts.loading = false;
+    ts.note_applied_revision(snapshot_last_seq);
+    let max_rev = snapshot_last_seq;
+    drop(s);
 
     if needs_watcher {
         state.borrow_mut().table(table).watching = true;
@@ -548,7 +609,10 @@ async fn load_table_snapshot(
 
     // Use the consumer-based load_all (nats-wasip3 ≥ 0.8.2) which fetches in
     // batches using DeliverPolicy::LastPerSubject — O(keys) not O(stream_seq).
-    let raw_entries = kv.load_all().await.map_err(|e| format!("load table: {e}"))?;
+    let raw_entries = kv
+        .load_all()
+        .await
+        .map_err(|e| format!("load table: {e}"))?;
 
     let entries = raw_entries
         .into_iter()
@@ -642,10 +706,7 @@ async fn ensure_min_revision(
             break;
         }
 
-        wasip3::clocks::monotonic_clock::wait_for(secs(
-            consistency_watcher_wait_step_secs(),
-        ))
-        .await;
+        wasip3::clocks::monotonic_clock::wait_for(secs(consistency_watcher_wait_step_secs())).await;
     }
 
     let caught_up_after_wait = {
@@ -741,7 +802,7 @@ async fn run_table_watcher(
             _ => {}
         }
     }
-    // Watcher disconnected. Reset both flags so the next request to this
+    // Watcher disconnected. Reset flags so the next request to this
     // table triggers a full reload from KV + fresh watcher. Without resetting
     // `loaded`, the cache silently diverges and never re-syncs.
     {
@@ -749,6 +810,7 @@ async fn run_table_watcher(
         let ts = s.table(table);
         ts.watching = false;
         ts.loaded = false;
+        ts.loading = false;
         ts.applied_revision = 0;
     }
     eprintln!("lattice-db: watcher stopped for table {table} — will reload on next request");
@@ -845,15 +907,7 @@ async fn handle_delete(
     // Update cache.
     state.borrow_mut().table(&req.table).remove(&req.key);
 
-    publish_change(
-        client,
-        "delete",
-        &req.table,
-        &req.key,
-        None,
-        None,
-        instance,
-    );
+    publish_change(client, "delete", &req.table, &req.key, None, None, instance);
     ok_json(&EmptyResp {})
 }
 
@@ -920,10 +974,7 @@ async fn handle_purge(
             .purge_with_ttl(&req.key, secs(ttl))
             .await
             .map_err(|e| format!("{e}"))?,
-        (None, None) => kv
-            .purge(&req.key)
-            .await
-            .map_err(|e| format!("{e}"))?,
+        (None, None) => kv.purge(&req.key).await.map_err(|e| format!("{e}"))?,
     };
 
     state.borrow_mut().table(&req.table).remove(&req.key);
@@ -1637,5 +1688,3 @@ pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     }
     acc == 0
 }
-
-

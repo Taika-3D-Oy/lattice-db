@@ -28,7 +28,9 @@ use std::cell::Cell;
 use std::collections::HashMap;
 
 use nats_wasi::client::secs;
-use nats_wasi::jetstream::{AckPolicy, ConsumerConfig, DeliverPolicy, JetStream, ReplayPolicy, StreamConfig};
+use nats_wasi::jetstream::{
+    AckPolicy, ConsumerConfig, DeliverPolicy, JetStream, ReplayPolicy, StreamConfig,
+};
 use nats_wasi::kv::{KeyValue, KvConfig};
 
 use crate::state::SharedState;
@@ -345,7 +347,10 @@ pub async fn execute(
 ///
 /// Bucket-wide TTL ensures that a replica which crashes mid-rollback does not
 /// block recovery forever — stale locks expire and another replica can claim.
-async fn open_recovery_lock_bucket(js: &JetStream, instance: &str) -> Result<KeyValue, nats_wasi::Error> {
+async fn open_recovery_lock_bucket(
+    js: &JetStream,
+    instance: &str,
+) -> Result<KeyValue, nats_wasi::Error> {
     KeyValue::new(
         js.clone(),
         KvConfig {
@@ -469,7 +474,10 @@ pub async fn recover(
 
     const RECOVERY_FETCH_BATCH: u32 = 256;
     loop {
-        let msgs = match js.fetch(&stream, &consumer.name, RECOVERY_FETCH_BATCH).await {
+        let msgs = match js
+            .fetch(&stream, &consumer.name, RECOVERY_FETCH_BATCH)
+            .await
+        {
             Ok(m) => m,
             Err(e) => {
                 eprintln!("lattice-db: wal recovery fetch error: {e}");

@@ -42,6 +42,8 @@ pub struct TableState {
     pub schema: Option<serde_json::Value>,
     /// Whether this table has been fully loaded from NATS KV.
     pub loaded: bool,
+    /// Whether a load is currently in-flight (prevents concurrent loads).
+    pub loading: bool,
     /// Whether a background KV watcher is running for this table.
     pub watching: bool,
     /// Highest KV revision known to be applied to this table state.
@@ -56,6 +58,7 @@ impl TableState {
             compound_indexes: HashMap::new(),
             schema: None,
             loaded: false,
+            loading: false,
             watching: false,
             applied_revision: 0,
         }

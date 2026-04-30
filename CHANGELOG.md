@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.6.4] - 2026-04-30
+
+### Fixed
+
+- **Duplicate watcher race condition**: Concurrent requests to the same unloaded table could
+  race through `ensure_loaded`, each spawning their own KV load + watcher. Added a `loading`
+  guard flag so only one task performs the load while others yield-wait. Prevents leaked NATS
+  consumers and stale-cache divergence when a redundant watcher disconnects.
+
 ## [1.6.3] - 2026-04-30
 
 ### Fixed
