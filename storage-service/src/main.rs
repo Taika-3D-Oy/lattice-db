@@ -121,7 +121,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     {
         let schema_kv = store::get_or_create_kv(&shared_store, "_schemas").await;
         if let Ok(kv) = schema_kv {
-            let mut max_rev = 0u64;
+            let mut last_seq = 0u64;
+            if let Ok(status) = kv.status().await {
+                last_seq = status.last_seq;
+            }
             if let Ok(entries) = kv.load_all().await {
                 let mut s = shared_state.borrow_mut();
                 for entry in &entries {
@@ -130,7 +133,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         eprintln!("lattice-db: loaded schema for table {}", entry.key);
                     }
                 }
-                max_rev = entries.iter().map(|e| e.revision).max().unwrap_or(0);
             }
             // Spawn schema watcher for cross-replica sync. Reconnects
             // automatically on disconnect so a NATS hiccup doesn't silently
@@ -138,7 +140,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let schema_state = shared_state.clone();
             let schema_kv_handle = kv.clone();
             wit_bindgen::spawn(async move {
-                let mut since = max_rev;
+                let mut since = last_seq;
                 loop {
                     let watcher = match schema_kv_handle.watch(since).await {
                         Ok(w) => w,
@@ -192,7 +194,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     {
         let index_kv = store::get_or_create_kv(&shared_store, "_indexes").await;
         if let Ok(kv) = index_kv {
-            let mut max_rev = 0u64;
+            let mut last_seq = 0u64;
+            if let Ok(status) = kv.status().await {
+                last_seq = status.last_seq;
+            }
             if let Ok(entries) = kv.load_all().await {
                 let mut s = shared_state.borrow_mut();
                 for entry in &entries {
@@ -222,7 +227,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     eprintln!("lattice-db: loaded index for {table}: {}", fields.join("+"));
                 }
-                max_rev = entries.iter().map(|e| e.revision).max().unwrap_or(0);
             }
             // Spawn index watcher for cross-replica sync. Reconnects
             // automatically on disconnect so a NATS hiccup doesn't silently
@@ -230,7 +234,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let index_state = shared_state.clone();
             let index_kv_handle = kv.clone();
             wit_bindgen::spawn(async move {
-                let mut since = max_rev;
+                let mut since = last_seq;
                 loop {
                     let watcher = match index_kv_handle.watch(since).await {
                         Ok(w) => w,

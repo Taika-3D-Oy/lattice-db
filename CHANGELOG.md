@@ -1,5 +1,21 @@
 # Changelog
 
+## [1.6.3] - 2026-04-30
+
+### Fixed
+
+- **Cold table load performance**: Replaced the sequential per-sequence `stream_get_msg` loop in
+  `load_table_snapshot` with the consumer-based `kv.load_all()` from nats-wasip3 0.8.2.
+  Uses `DeliverPolicy::LastPerSubject` with batch fetch — O(keys) instead of O(stream_seq).
+  Eliminates multi-second cold-load latency on buckets with high TTL churn (e.g. `lid-sessions`
+  with 8 live keys but 560 total sequence entries took ~4s, now <50ms).
+- **WAL recovery scan performance**: Startup recovery now scans the WAL via a batched pull
+  consumer fetch loop instead of per-sequence `stream_get_msg` calls.
+  This removes O(stream_seq) request overhead for large or sparse WAL streams.
+- **Schema/index watcher catch-up efficiency**: Startup watcher anchors for `_schemas` and
+  `_indexes` now use authoritative KV `status().last_seq` instead of max surviving entry revision,
+  avoiding unnecessary replay under delete/purge-heavy churn.
+
 ## [1.6.2]
 
 ### Changed

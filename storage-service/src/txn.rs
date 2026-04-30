@@ -28,7 +28,7 @@ use std::cell::Cell;
 use std::collections::HashMap;
 
 use nats_wasi::client::secs;
-use nats_wasi::jetstream::{JetStream, StreamConfig};
+use nats_wasi::jetstream::{AckPolicy, ConsumerConfig, DeliverPolicy, JetStream, ReplayPolicy, StreamConfig};
 use nats_wasi::kv::{KeyValue, KvConfig};
 
 use crate::state::SharedState;
@@ -417,7 +417,7 @@ pub async fn recover(
     store: &SharedStore,
     instance: &str,
 ) -> Result<u32, String> {
-    // Get stream info to know the sequence range.
+    // Get stream info to know if there is anything to recover.
     let info = match js.stream_info(&wal_stream(instance)).await {
         Ok(info) => info,
         Err(nats_wasi::Error::JetStream { code: 404, .. }) => return Ok(0),
@@ -439,8 +439,8 @@ pub async fn recover(
         }
     };
 
-    // Scan all WAL records by sequence number, capturing each PREPARE's
-    // server-side timestamp (RFC 3339) and authoring node_id.
+    // Scan WAL records in batches via a pull consumer, capturing each
+    // PREPARE's server-side timestamp (RFC 3339) and authoring node_id.
     struct PrepareInfo {
         ops: Vec<WalOp>,
         time: Option<String>,
@@ -450,43 +450,83 @@ pub async fn recover(
         std::collections::HashMap::new();
     let mut resolved: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    let first = info.state.first_seq;
-    let last = info.state.last_seq;
+    let stream = wal_stream(instance);
+    let consumer_cfg = ConsumerConfig {
+        durable_name: None,
+        filter_subject: Some(wal_subject(instance)),
+        deliver_policy: DeliverPolicy::All,
+        ack_policy: AckPolicy::None,
+        max_deliver: 1,
+        replay_policy: Some(ReplayPolicy::Instant),
+        mem_storage: Some(true),
+        ..Default::default()
+    };
 
-    for seq in first..=last {
-        let msg = match js.stream_get_msg(&wal_stream(instance), seq).await {
-            Ok(Some(m)) => m,
-            Ok(None) => continue,
+    let consumer = match js.create_consumer(&stream, &consumer_cfg).await {
+        Ok(info) => info,
+        Err(e) => return Err(format!("wal recovery consumer create: {e}")),
+    };
+
+    const RECOVERY_FETCH_BATCH: u32 = 256;
+    loop {
+        let msgs = match js.fetch(&stream, &consumer.name, RECOVERY_FETCH_BATCH).await {
+            Ok(m) => m,
             Err(e) => {
-                eprintln!("lattice-db: wal recovery skip seq {seq}: {e}");
-                continue;
+                eprintln!("lattice-db: wal recovery fetch error: {e}");
+                break;
             }
         };
 
-        let record: WalRecord = match serde_json::from_slice(&msg.data) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("lattice-db: wal recovery skip seq {seq}: bad record: {e}");
-                continue;
-            }
-        };
+        if msgs.is_empty() {
+            break;
+        }
 
-        match record.status {
-            WalStatus::Prepare => {
-                prepares.insert(
-                    record.id,
-                    PrepareInfo {
-                        ops: record.ops,
-                        time: msg.time,
-                        author_node_id: record.node_id,
-                    },
-                );
-            }
-            WalStatus::Commit | WalStatus::Abort => {
-                resolved.insert(record.id);
+        let msgs_len = msgs.len();
+        for msg in msgs {
+            let seq = msg
+                .headers
+                .as_ref()
+                .and_then(|h| h.get("Nats-Sequence"))
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+
+            let record: WalRecord = match serde_json::from_slice(&msg.payload) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("lattice-db: wal recovery skip seq {seq}: bad record: {e}");
+                    continue;
+                }
+            };
+
+            let time = msg
+                .headers
+                .as_ref()
+                .and_then(|h| h.get("Nats-Time-Stamp"))
+                .map(str::to_string);
+
+            match record.status {
+                WalStatus::Prepare => {
+                    prepares.insert(
+                        record.id,
+                        PrepareInfo {
+                            ops: record.ops,
+                            time,
+                            author_node_id: record.node_id,
+                        },
+                    );
+                }
+                WalStatus::Commit | WalStatus::Abort => {
+                    resolved.insert(record.id);
+                }
             }
         }
+
+        if msgs_len < RECOVERY_FETCH_BATCH as usize {
+            break;
+        }
     }
+
+    let _ = js.delete_consumer(&stream, &consumer.name).await;
 
     // Local wall-clock now, used as the reference point for the grace check
     // against server-side timestamps. Modest local clock skew (sub-minute)
