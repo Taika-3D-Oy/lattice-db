@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.6.5] - 2026-04-30
+
+### Changed
+
+- **nats-wasip3 0.9.0**: Upgraded from 0.8.2. Migrated to aligned KV watch API:
+  - `watch(seq)` → `watch_all()` / `watch_all_from_revision(seq)` (schema, index, and table watchers)
+  - `cas_delete(key, rev)` → `delete_expect_revision(key, rev)` (canonical nats.rs naming)
+- New per-key watch APIs now available: `watch(key)`, `watch_with_history(key)`,
+  `watch_from_revision(key, rev)`, `entry(key)`, `history(key)`, `stream_name()`
+
 ## [1.6.4] - 2026-04-30
 
 ### Fixed

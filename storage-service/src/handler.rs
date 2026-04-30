@@ -754,7 +754,12 @@ async fn run_table_watcher(
     state: &SharedState,
     start_after: u64,
 ) {
-    let watcher = match kv.watch(start_after).await {
+    let watcher_res = if start_after == 0 {
+        kv.watch_all().await
+    } else {
+        kv.watch_all_from_revision(start_after).await
+    };
+    let watcher = match watcher_res {
         Ok(w) => w,
         Err(e) => {
             eprintln!("lattice-db: watcher setup failed for {table}: {e}");
@@ -925,7 +930,7 @@ async fn handle_cas_delete(
         .await
         .map_err(|e| format!("{e}"))?;
     // CAS delete — only tombstone if the current revision matches.
-    match kv.cas_delete(&req.key, req.revision).await {
+    match kv.delete_expect_revision(&req.key, req.revision).await {
         Ok(()) => {}
         Err(e) => {
             // On CAS failure, re-fetch the winning value so the client's next

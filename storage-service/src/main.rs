@@ -142,7 +142,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             wit_bindgen::spawn(async move {
                 let mut since = last_seq;
                 loop {
-                    let watcher = match schema_kv_handle.watch(since).await {
+                    let watcher_res = if since == 0 {
+                        schema_kv_handle.watch_all().await
+                    } else {
+                        schema_kv_handle.watch_all_from_revision(since).await
+                    };
+                    let watcher = match watcher_res {
                         Ok(w) => w,
                         Err(e) => {
                             eprintln!("lattice-db: schema watcher setup failed: {e} — retrying");
@@ -236,7 +241,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             wit_bindgen::spawn(async move {
                 let mut since = last_seq;
                 loop {
-                    let watcher = match index_kv_handle.watch(since).await {
+                    let watcher_res = if since == 0 {
+                        index_kv_handle.watch_all().await
+                    } else {
+                        index_kv_handle.watch_all_from_revision(since).await
+                    };
+                    let watcher = match watcher_res {
                         Ok(w) => w,
                         Err(e) => {
                             eprintln!("lattice-db: index watcher setup failed: {e} — retrying");
