@@ -18,7 +18,7 @@ Add to your `Cargo.toml`:
 ```toml
 [dependencies]
 lattice-sql-client = "1.0"
-nats-wasip3 = "0.7"
+nats-wasip3 = "0.8.2"
 ```
 
 ```rust

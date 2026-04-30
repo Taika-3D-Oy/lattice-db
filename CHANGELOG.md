@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.6.2]
+
+### Changed
+
+- **Dependency**: Bumped `nats-wasip3` from `0.8.1` to `0.8.2` across all four crates. No local API migration was required.
+
 ## [1.6.1] - 2026-04-29
 
 ### Fixed
@@ -11,7 +17,7 @@
 
 ### Changed
 
-- **Version Bumps**: Bumped all core crates to `1.6.1` (`storage-service`, `lattice-db-client`, `lattice-sql`, `lattice-sql-client`).
+- **Version Bumps**: Bumped all core crates to `1.6.2` (`storage-service`, `lattice-db-client`, `lattice-sql`, `lattice-sql-client`).
 
 ## [1.6.0] - 2026-04-29
 
