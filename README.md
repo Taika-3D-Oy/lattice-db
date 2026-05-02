@@ -7,6 +7,8 @@ The engine is a 663 KB `wasm32-wasip3` component. It connects to NATS, subscribe
 ```
 clients ──NATS req/rep──▶ storage-service (Wasm component, 663 KB)
                                 │
+co-located ──TCP :4080──▶       │
+  components                    │
                           NATS JetStream KV
                           (one bucket per table: ldb-{table})
 ```
@@ -134,6 +136,120 @@ Prerequisites: `kind`, `kubectl`, `helm`, `docker`, `cargo`, `wash`. The wasmClo
 
 For a public-registry deployment, push `storage_service.wasm` to OCI and apply [`deploy/workloaddeployment-public.yaml`](deploy/workloaddeployment-public.yaml).
 
+## Co-located TCP service (wasmCloud)
+
+When running on wasmCloud v2, you can deploy `storage-service` as a **co-located service** inside a `WorkloadDeployment`. Components in the same workload connect over localhost TCP (`127.0.0.1:4080`) instead of going through NATS request/reply — eliminating a network hop and giving sub-millisecond latency for reads.
+
+```
+┌─ WorkloadDeployment ──────────────────────────────┐
+│                                                    │
+│  component-a ──TCP──▶ storage-service ──▶ NATS KV │
+│  component-b ──TCP──┘       :4080                  │
+│                                                    │
+└────────────────────────────────────────────────────┘
+```
+
+### Wire protocol
+
+The TCP protocol is identical to the NATS JSON bodies, wrapped in a length-prefixed frame:
+
+```
+┌──────────────┬──────────────────────────────────┐
+│ 4 bytes (BE) │          JSON payload             │
+│  body length │  (same as NATS, with _op field)   │
+└──────────────┴──────────────────────────────────┘
+```
+
+The JSON body must include an `_op` field corresponding to the NATS subject suffix:
+
+```json
+{"_op": "get", "table": "users", "key": "user-123"}
+{"_op": "put", "table": "users", "key": "user-123", "value": {"name": "Alice"}}
+{"_op": "scan", "table": "sessions", "filters": {"user_id": {"eq": "user-123"}}}
+```
+
+### Configuration
+
+| Env var | Default | Description |
+|---|---|---|
+| `LDB_TCP_PORT` | `4080` | Port to listen on (localhost only) |
+
+The TCP listener runs alongside the NATS subscription loop. All existing NATS-based operations (`get`, `put`, `cas`, `scan`, `txn`, etc.) work over TCP with the same JSON format — just add `"_op": "..."` to specify the operation.
+
+### Deployment example (WorkloadDeployment)
+
+```yaml
+apiVersion: runtime.wasmcloud.dev/v1alpha1
+kind: WorkloadDeployment
+metadata:
+  name: my-app
+spec:
+  lattice: default
+  service:
+    name: storage-service
+    image: ghcr.io/your-org/lattice-db/storage-service:latest
+    imagePullPolicy: Always
+    config:
+      - name: storage-service-config  # ConfigMap with NATS_URL, LDB_INSTANCE, etc.
+  components:
+    - name: my-component
+      image: ghcr.io/your-org/my-component:latest
+      replicas: 1
+```
+
+The service runs as a sidecar — one long-lived process that all component instances in the workload connect to.
+
+### Client example (Rust, wasm32-wasip3)
+
+```rust
+use wasi::sockets::types::{IpAddressFamily, IpSocketAddress, Ipv4SocketAddress, TcpSocket};
+
+async fn ldb_request(op: &str, payload: &serde_json::Value) -> Result<serde_json::Value, String> {
+    let mut payload = payload.clone();
+    payload.as_object_mut().unwrap()
+        .insert("_op".into(), serde_json::Value::String(op.into()));
+    let body = serde_json::to_vec(&payload).unwrap();
+
+    // Connect to co-located storage-service
+    let socket = TcpSocket::create(IpAddressFamily::Ipv4).unwrap();
+    let addr = IpSocketAddress::Ipv4(Ipv4SocketAddress { port: 4080, address: (127, 0, 0, 1) });
+    socket.connect(addr).await.unwrap();
+
+    let (mut rx, _rx_done) = socket.receive();
+    let (mut tx, tx_rx) = wit_stream::new::<u8>();
+    let _send = socket.send(tx_rx);
+
+    // Write: [4-byte BE length][JSON body]
+    let mut frame = Vec::with_capacity(4 + body.len());
+    frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&body);
+    tx.write_all(frame).await;
+
+    // Read response: [4-byte BE length][JSON body]
+    let mut buf = Vec::new();
+    while buf.len() < 4 {
+        let (status, data) = rx.read(Vec::with_capacity(4096)).await;
+        match status {
+            StreamResult::Complete(0) => return Err("eof".into()),
+            StreamResult::Complete(n) => buf.extend_from_slice(&data[..n]),
+            _ => return Err("read error".into()),
+        }
+    }
+    let resp_len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    buf.drain(..4);
+    while buf.len() < resp_len {
+        let (status, data) = rx.read(Vec::with_capacity(4096)).await;
+        match status {
+            StreamResult::Complete(0) => return Err("eof".into()),
+            StreamResult::Complete(n) => buf.extend_from_slice(&data[..n]),
+            _ => return Err("read error".into()),
+        }
+    }
+
+    serde_json::from_slice(&buf[..resp_len]).map_err(|e| e.to_string())
+}
+```
+
 ## Test
 
 ```bash
@@ -168,6 +284,7 @@ Tunables: `BENCH_DURATION_SECS` (10), `BENCH_CONCURRENCY` (64), `BENCH_TXN_CONCU
 ```
 storage-service/    # the database (wasm component)
   src/main.rs       #   NATS connection, queue subscription, watchers, WAL recovery
+  src/tcp_server.rs #   localhost TCP listener for co-located component access
   src/handler.rs    #   request dispatch for all {instance}.* operations
   src/state.rs      #   in-memory cache, indexes, query engine, aggregation
   src/store.rs      #   NATS KV persistence
