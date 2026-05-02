@@ -93,10 +93,13 @@ Deploy one `storage-service` per application. Set `LDB_INSTANCE` in each deploym
 | `LDB_INSTANCE=instancename` | NATS subject prefix for messaging (e.g. `instancename.get`, `instancename-events.>`) |
 | `LDB_DATA_INSTANCE=instancename` | NATS KV bucket and WAL prefix (e.g. `instancename-users`, `instancename-txn`). Defaults to `LDB_INSTANCE`. |
 | `LDB_AUTH_TOKEN=...` | Every request must include `"_auth": "<token>"` |
-| `NATS_URL=...` | NATS address for messaging (req/rep subscriptions and events) |
-| `NATS_DATA_URL=...` | NATS address for storage (JetStream WAL and KV buckets). Defaults to `NATS_URL`. |
+| `NATS_URL=...` | NATS address for messaging (req/rep subscriptions and events). **Optional** — if omitted, NATS request/reply is disabled. |
+| `NATS_DATA_URL=...` | NATS address for storage (JetStream WAL and KV buckets). Falls back to `NATS_URL` if not set. **At least one of `NATS_URL` or `NATS_DATA_URL` must be set.** |
+| `LDB_TCP_PORT=4080` | Enable localhost TCP listener on the given port. **Optional** — if omitted, TCP is disabled. |
 | `LDB_CONSISTENCY_WATCHER_WAIT_STEPS` | Number of short watcher-poll attempts before forced table reload on consistency-gated reads. Default `2` (range `0..60`). |
 | `LDB_CONSISTENCY_WATCHER_WAIT_STEP_SECS` | Seconds per watcher-poll attempt. Default `1` (range `0..30`). |
+
+**Transport modes:** At least one of `NATS_URL` or `LDB_TCP_PORT` must be set. Both can be enabled simultaneously for hybrid deployments where some clients use NATS and co-located components use TCP.
 
 `LDB_INSTANCE` defaults to `ldb`. Allowed characters: alphanumeric, `_`, `-`; max 64 chars.
 
