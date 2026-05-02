@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.7.1] - 2026-05-02
+
+### Fixed
+
+- **TCP handler deadlock**: `wit_bindgen::spawn()` does not work in wasmCloud service
+  context — spawned tasks are never polled by the async executor. Changed to inline
+  `.await` for `handle_connection`, fixing the deadlock where clients connected but
+  never received responses.
+- Removed debug logging added during diagnosis.
+
 ## [1.7.0] - 2026-04-30
 
 ### Added

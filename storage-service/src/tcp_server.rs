@@ -74,9 +74,7 @@ async fn run_listener(
                     let cfg = config.clone();
                     let st = state.clone();
                     let sto = store.clone();
-                    wit_bindgen::spawn(async move {
-                        handle_connection(conn, client, js, cfg, st, sto).await;
-                    });
+                    handle_connection(conn, client, js, cfg, st, sto).await;
                 }
             }
             StreamResult::Dropped | StreamResult::Cancelled => {

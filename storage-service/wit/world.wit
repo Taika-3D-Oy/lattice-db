@@ -1,0 +1,11 @@
+package taika3d:ldb;
+
+interface storage {
+    /// Send a JSON request string and get a JSON response string.
+    /// Format: {"_op": "...", ...}
+    request: func(json-payload: string) -> result<string, string>;
+}
+
+world storage-service {
+    export storage;
+}
