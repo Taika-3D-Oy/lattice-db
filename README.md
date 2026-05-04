@@ -55,6 +55,7 @@ All requests are NATS request/reply on `ldb.{op}`. Bodies are JSON; binary value
 | `ldb.index.create` / `ldb.index.drop` / `ldb.index.list` | `{table, field}` or `{table, fields: [...]}` (compound) |
 | `ldb.txn` | `{ops: [{op, table, key, value?}]}` — atomic, max 64 ops |
 | `ldb.schema.set` / `ldb.schema.get` / `ldb.schema.delete` | `{table, schema}` |
+| `ldb.schedule_put` | `{table, key, value, at, ttl_seconds?}` — delayed write at RFC 3339 UTC timestamp (NATS 2.14+) |
 
 Filters use `eq`, `neq`, `gt`, `gte`, `lt`, `lte`, `prefix`. Schemas validate `put` / `create` / `cas` / `batch.put`.
 

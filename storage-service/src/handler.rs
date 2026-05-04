@@ -19,6 +19,7 @@
 //! ldb.purge            {table, key, revision?, ttl_seconds?} → {}
 //! ldb.get_revision     {table, key, revision}           → {key, value, revision, operation}
 //! ldb.txn             {ops: [{op, table, key, value?}]} → {ok, results}
+//! ldb.schedule_put    {table, key, value, at}           → {}
 //! ```
 //!
 //! All values in request/response are base64-encoded when binary.
@@ -32,6 +33,7 @@ use std::sync::OnceLock;
 
 use nats_wasi::client::{secs, Client, Message};
 use nats_wasi::jetstream::JetStream;
+use nats_wasi::schedule::Schedule;
 
 use crate::state::{self, FieldFilter, SharedState};
 use crate::store::SharedStore;
@@ -285,6 +287,26 @@ struct SchemaSetReq {
 }
 
 #[derive(Deserialize)]
+struct SchedulePutReq {
+    table: String,
+    key: String,
+    value: String, // base64
+    /// RFC 3339 UTC timestamp at which the write should fire.
+    at: String,
+    #[serde(default)]
+    ttl_seconds: Option<u64>,
+}
+
+/// Body stored in the schedule message and re-delivered to the fire subject.
+#[derive(Serialize, Deserialize)]
+struct ScheduleFireBody {
+    /// base64-encoded value to write.
+    v: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ttl: Option<u64>,
+}
+
+#[derive(Deserialize)]
 struct IndexCreateReq {
     table: String,
     /// Single field index.
@@ -466,6 +488,9 @@ pub async fn handle(
         "schema.set" => handle_schema_set(state, store, &payload).await,
         "schema.get" => handle_schema_get(state, &payload),
         "schema.delete" => handle_schema_delete(state, store, &payload).await,
+        "schedule_put" => {
+            handle_schedule_put(js, state, store, &payload, config.data_instance.as_str()).await
+        }
         _ => Err(format!("unknown operation: {op}")),
     };
 
@@ -1572,6 +1597,131 @@ pub(crate) fn handle_schema_get(state: &SharedState, payload: &[u8]) -> Result<V
         .and_then(|t| t.schema.clone())
         .unwrap_or(serde_json::Value::Null);
     ok_json(&SchemaResp { schema })
+}
+
+/// Registers a one-shot delayed write via NATS 2.14+ message scheduling (ADR-51).
+///
+/// Validates the request, encodes the value into the schedule body, and
+/// publishes a schedule message. The NATS server fires the body to the
+/// fire subject when `at` arrives; `handle_schedule_fire` performs the KV put.
+pub(crate) async fn handle_schedule_put(
+    js: &JetStream,
+    state: &SharedState,
+    store: &SharedStore,
+    payload: &[u8],
+    data_instance: &str,
+) -> Result<Vec<u8>, String> {
+    let req: SchedulePutReq = parse_req(payload)?;
+    let value = B64.decode(&req.value).map_err(|e| format!("base64: {e}"))?;
+    validate_write_bounds(&req.table, &req.key, &value)?;
+
+    // Validate the `at` timestamp is at least superficially RFC 3339-shaped.
+    // The NATS server validates the full semantics.
+    if req.at.len() < 10 || !req.at.starts_with(|c: char| c.is_ascii_digit()) {
+        return Err("at must be an RFC 3339 timestamp (e.g. 2026-06-01T09:00:00Z)".into());
+    }
+
+    // Schema validation against in-memory schema (if any).
+    {
+        let s = state.borrow();
+        if let Some(schema) = s.tables.get(&req.table).and_then(|t| t.schema.as_ref()) {
+            state::validate_schema(&value, schema)?;
+        }
+    }
+
+    // Ensure the table's KV bucket exists so the fire handler can write to it.
+    let _ = crate::store::get_or_create_kv(store, &req.table)
+        .await
+        .map_err(|e| format!("{e}"))?;
+
+    let fire_body = ScheduleFireBody {
+        v: req.value.clone(),
+        ttl: req.ttl_seconds,
+    };
+    let body = serde_json::to_vec(&fire_body).map_err(|e| format!("serialize: {e}"))?;
+
+    crate::schedule::publish_schedule_at(js, data_instance, &req.table, &req.key, &body, &req.at)
+        .await
+        .map_err(|e| format!("{e}"))?;
+
+    ok_json(&EmptyResp {})
+}
+
+/// Called when NATS fires a scheduled write to `{data_instance}-sched-fire.{table}.{key}`.
+///
+/// Extracts table and key from the subject, decodes the fire body, and
+/// performs the KV put. Also publishes the standard change event.
+pub(crate) async fn handle_schedule_fire(
+    client: &Client,
+    store: &SharedStore,
+    state: &SharedState,
+    subject: &str,
+    payload: &[u8],
+    instance: &str,
+) {
+    // Subject format: `{data_instance}-sched-fire.{table}.{key}`.
+    // Find the first '.' after the prefix to extract table and key.
+    let fire_part = match subject.find("-sched-fire.") {
+        Some(idx) => &subject[idx + "-sched-fire.".len()..],
+        None => {
+            eprintln!("lattice-db: schedule fire: unrecognised subject {subject}");
+            return;
+        }
+    };
+    let (table, key) = match fire_part.split_once('.') {
+        Some(pair) => pair,
+        None => {
+            eprintln!("lattice-db: schedule fire: missing key in subject {subject}");
+            return;
+        }
+    };
+
+    let fire_body: ScheduleFireBody = match serde_json::from_slice(payload) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("lattice-db: schedule fire: bad body on {subject}: {e}");
+            return;
+        }
+    };
+
+    let value = match B64.decode(&fire_body.v) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("lattice-db: schedule fire: base64 decode error on {subject}: {e}");
+            return;
+        }
+    };
+
+    let kv = match crate::store::get_or_create_kv(store, table).await {
+        Ok(kv) => kv,
+        Err(e) => {
+            eprintln!("lattice-db: schedule fire: kv error for table {table}: {e}");
+            return;
+        }
+    };
+
+    let result = match fire_body.ttl {
+        Some(ttl) => kv.put_with_ttl(key, &value, secs(ttl)).await,
+        None => kv.put(key, &value).await,
+    };
+
+    match result {
+        Ok(revision) => {
+            state.borrow_mut().table(table).upsert(key, value, revision);
+            publish_change(
+                client,
+                "put",
+                table,
+                key,
+                Some(&fire_body.v),
+                Some(revision),
+                instance,
+            );
+        }
+        Err(e) => {
+            eprintln!("lattice-db: schedule fire: kv put failed for {table}/{key}: {e}");
+        }
+    }
 }
 
 pub(crate) async fn handle_schema_delete(

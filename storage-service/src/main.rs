@@ -5,6 +5,7 @@
 
 mod handler;
 mod log;
+mod schedule;
 mod state;
 mod store;
 mod tcp_server;
@@ -32,7 +33,9 @@ impl wasip3::exports::cli::run::Guest for LatticeDb {
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Determine which transport modes are enabled.
-    let nats_url = std::env::var("NATS_URL").ok().or_else(|| std::env::args().nth(1));
+    let nats_url = std::env::var("NATS_URL")
+        .ok()
+        .or_else(|| std::env::args().nth(1));
     let nats_data_url = std::env::var("NATS_DATA_URL").ok();
     let tcp_port = std::env::var("LDB_TCP_PORT")
         .ok()
@@ -129,6 +132,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     txn::ensure_wal_stream(&js, &data_instance)
         .await
         .map_err(|e| format!("wal stream setup: {e}"))?;
+
+    // Set up schedules stream (NATS 2.14+ ADR-51 message scheduling).
+    schedule::ensure_schedule_stream(&js, &data_instance)
+        .await
+        .map_err(|e| format!("schedule stream setup: {e}"))?;
 
     let recovered = txn::recover(&js, &shared_state, &shared_store, &data_instance).await?;
     if recovered > 0 {
@@ -348,6 +356,40 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             shared_state.clone(),
             shared_store.clone(),
         );
+    }
+
+    // Subscribe to fired schedule deliveries (NATS 2.14+ ADR-51).
+    // The NATS server publishes here when a scheduled write's @at timestamp fires.
+    // We extract table/key from the subject and perform the KV put.
+    {
+        let fire_sub_subject = schedule::schedule_fire_wildcard(&data_instance);
+        let fire_sub = data_client.subscribe(&fire_sub_subject)?;
+        let fire_state = shared_state.clone();
+        let fire_store = shared_store.clone();
+        let fire_client = data_client.clone();
+        let fire_instance = instance.clone();
+        wit_bindgen::spawn(async move {
+            loop {
+                let Ok(msg) = fire_sub.next().await else {
+                    break;
+                };
+                let fire_state = fire_state.clone();
+                let fire_store = fire_store.clone();
+                let fire_client = fire_client.clone();
+                let fire_instance = fire_instance.clone();
+                wit_bindgen::spawn(async move {
+                    handler::handle_schedule_fire(
+                        &fire_client,
+                        &fire_store,
+                        &fire_state,
+                        &msg.subject,
+                        &msg.payload,
+                        &fire_instance,
+                    )
+                    .await;
+                });
+            }
+        });
     }
 
     // Subscribe to all lattice-db operations (queue group for scaling).

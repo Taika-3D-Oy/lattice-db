@@ -1,5 +1,39 @@
 # Changelog
 
+## [1.8.0] - 2026-05-04
+
+### Added
+
+- **`schedule_put` — server-side delayed writes (NATS 2.14+, ADR-51)**:
+  Registers a one-shot write that the NATS server delivers at a specified
+  RFC 3339 UTC timestamp, with no client-side timers or cron infrastructure
+  required.
+  - New `{instance}.schedule_put` operation: `{table, key, value, at, ttl_seconds?}`.
+  - New `schedule.rs` module in `storage-service`: `ensure_schedule_stream` creates
+    a dedicated `{data_instance}-sched` JetStream stream with `allow_msg_schedules: true`
+    on startup.  Subject layout:
+    - `{data_instance}-sched.{table}.{key}` — holds the schedule definition
+    - `{data_instance}-sched-fire.{table}.{key}` — NATS fires the body here at `at`
+  - `storage-service` subscribes to `{data_instance}-sched-fire.>` and on each
+    delivery performs a KV `put` (with optional TTL) and emits the standard change
+    event, so watches and consistency tokens work exactly as for regular puts.
+  - Schema validation is applied at schedule registration time so invalid values
+    are rejected immediately, not silently dropped at fire time.
+  - Client: `LatticeDb::schedule_put(table, key, value, at)` and
+    `LatticeDb::schedule_put_with_ttl(table, key, value, at, ttl_seconds)`.
+
+### Changed
+
+- **Dependency**: `nats-wasip3` bumped from `0.9.1` to `0.11.0` across all four
+  crates (`storage-service`, `lattice-db-client`, `lattice-sql`, `lattice-sql-client`).
+  - **0.10.0**: `StreamConfig` gains `mirror`, `sources`, `republish`,
+    `subject_transform`, `placement` fields; `ConnectConfig::no_echo`; payload
+    size pre-check before publish (`Error::MaxPayloadExceeded`).
+  - **0.11.0**: new `nats_wasip3::schedule` module (`Schedule`, `ScheduleSpec`,
+    `after_secs_rfc3339`, header constants); `StreamConfig::allow_msg_schedules` field.
+  - **Migration**: `StreamConfig` literals that did not use `..Default::default()`
+    required updating (`storage-service/src/txn.rs` WAL stream config updated).
+
 ## [1.7.1] - 2026-05-02
 
 ### Fixed

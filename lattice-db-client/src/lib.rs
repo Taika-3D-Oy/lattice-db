@@ -406,6 +406,16 @@ struct AggReqW<'a> {
 #[derive(Serialize)]
 struct SchemaSetReqW<'a> { table: &'a str, schema: &'a serde_json::Value }
 
+#[derive(Serialize)]
+struct SchedulePutReqW<'a> {
+    table: &'a str,
+    key: &'a str,
+    value: String, // base64
+    at: &'a str,   // RFC 3339 UTC
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ttl_seconds: Option<u64>,
+}
+
 // Responses
 #[derive(Deserialize)] struct RowR { key: String, value: String, revision: u64 }
 #[derive(Deserialize)] struct RevisionR { revision: u64 }
@@ -778,6 +788,42 @@ impl LatticeDb {
     /// Delete the schema for a table.
     pub async fn delete_schema(&self, table: &str) -> Result<(), Error> {
         let _: serde_json::Value = self.req(&self.subj("schema.delete"), &TableReq { table }).await?;
+        Ok(())
+    }
+
+    /// Register a one-shot delayed write (NATS 2.14+ message scheduling).
+    ///
+    /// The NATS server persists the `value` and performs the write to `table`/`key`
+    /// when the RFC 3339 UTC timestamp `at` arrives.  Requires the server to run
+    /// NATS ≥ 2.14.
+    ///
+    /// # Example
+    /// ```rust,no_run
+    /// # async fn example(db: lattice_db_client::LatticeDb) -> Result<(), lattice_db_client::Error> {
+    /// db.schedule_put("orders", "order-42", b"{\"status\":\"shipped\"}", "2026-06-01T09:00:00Z").await?;
+    /// # Ok(()) }
+    /// ```
+    pub async fn schedule_put(&self, table: &str, key: &str, value: &[u8], at: &str) -> Result<(), Error> {
+        let _: serde_json::Value = self.req(&self.subj("schedule_put"), &SchedulePutReqW {
+            table,
+            key,
+            value: B64.encode(value),
+            at,
+            ttl_seconds: None,
+        }).await?;
+        Ok(())
+    }
+
+    /// Like [`schedule_put`][Self::schedule_put] but the written key also gets a TTL,
+    /// so the key expires `ttl_seconds` after it is written.
+    pub async fn schedule_put_with_ttl(&self, table: &str, key: &str, value: &[u8], at: &str, ttl_seconds: u64) -> Result<(), Error> {
+        let _: serde_json::Value = self.req(&self.subj("schedule_put"), &SchedulePutReqW {
+            table,
+            key,
+            value: B64.encode(value),
+            at,
+            ttl_seconds: Some(ttl_seconds),
+        }).await?;
         Ok(())
     }
 

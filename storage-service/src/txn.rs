@@ -188,6 +188,7 @@ pub async fn ensure_wal_stream(js: &JetStream, instance: &str) -> Result<(), nat
         allow_direct: true,
         allow_rollup_hdrs: false,
         allow_msg_ttl: false,
+        ..Default::default()
     };
     js.create_stream(&config).await?;
     Ok(())

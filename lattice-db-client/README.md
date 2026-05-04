@@ -78,6 +78,7 @@ db.transaction(vec![
 | `transaction` | Atomic multi-operation transactions |
 | `set_schema` / `get_schema` / `delete_schema` | JSON schema validation |
 | `create_index` / `list_indexes` / `drop_index` | Secondary indexes |
+| `schedule_put` / `schedule_put_with_ttl` | Delayed write at a future RFC 3339 timestamp (NATS 2.14+) |
 
 ## Authentication & instance
 
