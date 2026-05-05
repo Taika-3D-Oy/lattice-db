@@ -61,6 +61,40 @@ const DEFAULT_CONSISTENCY_WATCHER_WAIT_STEPS: u32 = 2;
 /// Duration of each watcher polling interval.
 const DEFAULT_CONSISTENCY_WATCHER_WAIT_STEP_SECS: u64 = 1;
 
+// ── Master key (loaded once at startup) ─────────────────────────────────────
+
+/// Global master key for AES-256-GCM envelope encryption.
+/// Populated on first encrypted write or read via `master_key()`.
+static MASTER_KEY: OnceLock<[u8; 32]> = OnceLock::new();
+
+/// Return the master key, loading it on first call.
+pub(crate) fn master_key() -> &'static [u8; 32] {
+    MASTER_KEY.get_or_init(crate::vault::load_master_key)
+}
+
+/// Encrypt `plaintext` if the table is marked encrypted; otherwise return a clone.
+pub(crate) fn maybe_encrypt(table: &str, key: &str, plaintext: &[u8], encrypted: bool) -> Vec<u8> {
+    if encrypted {
+        crate::vault::encrypt(master_key(), table, key, plaintext)
+    } else {
+        plaintext.to_vec()
+    }
+}
+
+/// Decrypt `bytes` if the table is marked encrypted; otherwise return a clone.
+pub(crate) fn maybe_decrypt(
+    table: &str,
+    key: &str,
+    bytes: Vec<u8>,
+    encrypted: bool,
+) -> Result<Vec<u8>, String> {
+    if encrypted {
+        crate::vault::decrypt(master_key(), table, key, &bytes)
+    } else {
+        Ok(bytes)
+    }
+}
+
 fn env_u32(name: &str, default: u32, min: u32, max: u32) -> u32 {
     let raw = match std::env::var(name) {
         Ok(v) => v,
@@ -565,7 +599,7 @@ async fn ensure_loaded(
         state.borrow_mut().table(table).watching = true;
         let watch_state = state.clone();
         let table_name = table.to_string();
-        wit_bindgen::spawn(async move {
+        wasip3::spawn(async move {
             run_table_watcher(kv, &table_name, &watch_state, max_rev).await;
         });
         return Ok(());
@@ -605,8 +639,16 @@ async fn ensure_loaded(
     };
     let mut s = state.borrow_mut();
     let ts = s.table(table);
+    let encrypted = ts.encrypted;
     for (key, value, revision) in entries {
-        ts.upsert(&key, value, revision);
+        let plaintext = match maybe_decrypt(table, &key, value, encrypted) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("lattice-db: decrypt failed loading {table}:{key}: {e}");
+                continue;
+            }
+        };
+        ts.upsert(&key, plaintext, revision);
     }
     ts.loaded = true;
     ts.loading = false;
@@ -618,7 +660,7 @@ async fn ensure_loaded(
         state.borrow_mut().table(table).watching = true;
         let watch_state = state.clone();
         let table_name = table.to_string();
-        wit_bindgen::spawn(async move {
+        wasip3::spawn(async move {
             run_table_watcher(kv, &table_name, &watch_state, max_rev).await;
         });
     }
@@ -680,8 +722,16 @@ async fn reload_table_from_kv(
             },
         );
     }
+    let encrypted = ts.encrypted;
     for (key, value, revision) in entries {
-        ts.upsert(&key, value, revision);
+        let plaintext = match maybe_decrypt(table, &key, value, encrypted) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("lattice-db: decrypt failed reloading {table}:{key}: {e}");
+                continue;
+            }
+        };
+        ts.upsert(&key, plaintext, revision);
     }
     ts.loaded = true;
     ts.note_applied_revision(snapshot_last_seq);
@@ -813,7 +863,22 @@ async fn run_table_watcher(
                     .get(&entry.key)
                     .map_or(false, |r| r.revision >= entry.revision);
                 if !dominated {
-                    ts.upsert(&entry.key, entry.value, entry.revision);
+                    let plaintext = if ts.encrypted {
+                        match crate::vault::decrypt(master_key(), table, &entry.key, &entry.value) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                eprintln!(
+                                    "lattice-db: watcher decrypt failed {table}:{}: {e}",
+                                    entry.key
+                                );
+                                ts.note_applied_revision(entry.revision);
+                                continue;
+                            }
+                        }
+                    } else {
+                        entry.value
+                    };
+                    ts.upsert(&entry.key, plaintext, entry.revision);
                 }
                 ts.note_applied_revision(entry.revision);
             }
@@ -891,12 +956,17 @@ pub(crate) async fn handle_put(
     let kv = crate::store::get_or_create_kv(store, &req.table)
         .await
         .map_err(|e| format!("{e}"))?;
+    let encrypted = state.borrow().is_encrypted(&req.table);
+    let store_bytes = maybe_encrypt(&req.table, &req.key, &value, encrypted);
     let revision = match req.ttl_seconds {
         Some(ttl) => kv
-            .put_with_ttl(&req.key, &value, secs(ttl))
+            .put_with_ttl(&req.key, &store_bytes, secs(ttl))
             .await
             .map_err(|e| format!("{e}"))?,
-        None => kv.put(&req.key, &value).await.map_err(|e| format!("{e}"))?,
+        None => kv
+            .put(&req.key, &store_bytes)
+            .await
+            .map_err(|e| format!("{e}"))?,
     };
 
     state
@@ -1069,12 +1139,14 @@ pub(crate) async fn handle_cas(
     let kv = crate::store::get_or_create_kv(store, &req.table)
         .await
         .map_err(|e| format!("{e}"))?;
+    let encrypted = state.borrow().is_encrypted(&req.table);
+    let store_bytes = maybe_encrypt(&req.table, &req.key, &value, encrypted);
     let result = match req.ttl_seconds {
         Some(ttl) => {
-            kv.update_with_ttl(&req.key, &value, req.revision, secs(ttl))
+            kv.update_with_ttl(&req.key, &store_bytes, req.revision, secs(ttl))
                 .await
         }
-        None => kv.update(&req.key, &value, req.revision).await,
+        None => kv.update(&req.key, &store_bytes, req.revision).await,
     };
     // On success, update the local cache. On failure, proactively re-fetch
     // the winning value from NATS so the client's next retry sees the current
@@ -1083,11 +1155,26 @@ pub(crate) async fn handle_cas(
         Ok(r) => r,
         Err(e) => {
             if let Ok(Some(current)) = kv.get(&req.key).await {
-                state.borrow_mut().table(&req.table).upsert(
-                    &req.key,
-                    current.value,
-                    current.revision,
-                );
+                let plaintext = if encrypted {
+                    match crate::vault::decrypt(master_key(), &req.table, &req.key, &current.value)
+                    {
+                        Ok(p) => p,
+                        Err(e) => {
+                            eprintln!(
+                                "lattice-db: cas fallback decrypt failed {table}:{key}: {e}",
+                                table = req.table,
+                                key = req.key
+                            );
+                            return Err(format!("{e}"));
+                        }
+                    }
+                } else {
+                    current.value
+                };
+                state
+                    .borrow_mut()
+                    .table(&req.table)
+                    .upsert(&req.key, plaintext, current.revision);
             }
             return Err(format!("{e}"));
         }
@@ -1135,13 +1222,15 @@ pub(crate) async fn handle_create(
     let kv = crate::store::get_or_create_kv(store, &req.table)
         .await
         .map_err(|e| format!("{e}"))?;
+    let encrypted = state.borrow().is_encrypted(&req.table);
+    let store_bytes = maybe_encrypt(&req.table, &req.key, &value, encrypted);
     let revision = match req.ttl_seconds {
         Some(ttl) => kv
-            .create_with_ttl(&req.key, &value, secs(ttl))
+            .create_with_ttl(&req.key, &store_bytes, secs(ttl))
             .await
             .map_err(|e| format!("{e}"))?,
         None => kv
-            .create(&req.key, &value)
+            .create(&req.key, &store_bytes)
             .await
             .map_err(|e| format!("{e}"))?,
     };
@@ -1489,6 +1578,7 @@ pub(crate) async fn handle_batch_put(
     let kv = crate::store::get_or_create_kv(store, &req.table)
         .await
         .map_err(|e| format!("{e}"))?;
+    let encrypted = state.borrow().is_encrypted(&req.table);
 
     let mut results = Vec::with_capacity(req.entries.len());
     for entry in &req.entries {
@@ -1496,13 +1586,14 @@ pub(crate) async fn handle_batch_put(
             .decode(&entry.value)
             .map_err(|e| format!("base64: {e}"))?;
         validate_write_bounds(&req.table, &entry.key, &value)?;
+        let store_bytes = maybe_encrypt(&req.table, &entry.key, &value, encrypted);
         let revision = match entry.ttl_seconds {
             Some(ttl) => kv
-                .put_with_ttl(&entry.key, &value, secs(ttl))
+                .put_with_ttl(&entry.key, &store_bytes, secs(ttl))
                 .await
                 .map_err(|e| format!("{e}"))?,
             None => kv
-                .put(&entry.key, &value)
+                .put(&entry.key, &store_bytes)
                 .await
                 .map_err(|e| format!("{e}"))?,
         };
@@ -1584,7 +1675,12 @@ pub(crate) async fn handle_schema_set(
         .await
         .map_err(|e| format!("{e}"))?;
 
-    state.borrow_mut().table(&req.table).schema = Some(req.schema);
+    state.borrow_mut().table(&req.table).schema = Some(req.schema.clone());
+    state.borrow_mut().table(&req.table).encrypted = req
+        .schema
+        .get("encrypted")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     ok_json(&EmptyResp {})
 }
 
@@ -1700,9 +1796,11 @@ pub(crate) async fn handle_schedule_fire(
         }
     };
 
+    let encrypted = state.borrow().is_encrypted(table);
+    let store_bytes = maybe_encrypt(table, key, &value, encrypted);
     let result = match fire_body.ttl {
-        Some(ttl) => kv.put_with_ttl(key, &value, secs(ttl)).await,
-        None => kv.put(key, &value).await,
+        Some(ttl) => kv.put_with_ttl(key, &store_bytes, secs(ttl)).await,
+        None => kv.put(key, &store_bytes).await,
     };
 
     match result {

@@ -9,8 +9,8 @@
 //! the in-memory cache via virtual pipes (sub-millisecond latency).
 
 use wasip3::sockets::types::{IpAddressFamily, IpSocketAddress, Ipv4SocketAddress, TcpSocket};
+use wasip3::wit_bindgen::{StreamReader, StreamResult, StreamWriter};
 use wasip3::wit_stream;
-use wit_bindgen::{StreamReader, StreamResult, StreamWriter};
 
 use crate::handler::{self, SharedConfig};
 use crate::state::SharedState;
@@ -34,7 +34,7 @@ pub fn start(
         .and_then(|v| v.parse::<u16>().ok())
         .unwrap_or(DEFAULT_PORT);
 
-    wit_bindgen::spawn(async move {
+    wasip3::spawn(async move {
         if let Err(e) = run_listener(port, client, js, config, state, store).await {
             eprintln!("lattice-db: tcp listener fatal: {e}");
         }

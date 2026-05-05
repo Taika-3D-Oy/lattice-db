@@ -40,6 +40,10 @@ pub struct TableState {
     pub compound_indexes: HashMap<String, CompoundIndex>,
     /// Optional JSON schema for validation on writes.
     pub schema: Option<serde_json::Value>,
+    /// Whether values in this table are stored encrypted (AES-256-GCM envelope).
+    /// Derived from the schema `"encrypted": true` field and cached here so the
+    /// hot write/read paths avoid a JSON lookup on every operation.
+    pub encrypted: bool,
     /// Whether this table has been fully loaded from NATS KV.
     pub loaded: bool,
     /// Whether a load is currently in-flight (prevents concurrent loads).
@@ -57,6 +61,7 @@ impl TableState {
             indexes: HashMap::new(),
             compound_indexes: HashMap::new(),
             schema: None,
+            encrypted: false,
             loaded: false,
             loading: false,
             watching: false,
@@ -213,6 +218,11 @@ impl State {
         self.tables
             .entry(name.to_string())
             .or_insert_with(TableState::new)
+    }
+
+    /// Return true if the named table is marked encrypted.
+    pub fn is_encrypted(&self, table: &str) -> bool {
+        self.tables.get(table).map_or(false, |t| t.encrypted)
     }
 }
 

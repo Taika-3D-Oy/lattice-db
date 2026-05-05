@@ -619,8 +619,11 @@ async fn apply_op(state: &SharedState, store: &SharedStore, wal_op: &WalOp) -> R
             let value = B64
                 .decode(wal_op.value_b64.as_ref().unwrap())
                 .map_err(|e| format!("base64: {e}"))?;
+            let encrypted = state.borrow().is_encrypted(&wal_op.table);
+            let store_bytes =
+                crate::handler::maybe_encrypt(&wal_op.table, &wal_op.key, &value, encrypted);
             let rev = kv
-                .put(&wal_op.key, &value)
+                .put(&wal_op.key, &store_bytes)
                 .await
                 .map_err(|e| format!("{e}"))?;
             state
@@ -633,8 +636,11 @@ async fn apply_op(state: &SharedState, store: &SharedStore, wal_op: &WalOp) -> R
             let value = B64
                 .decode(wal_op.value_b64.as_ref().unwrap())
                 .map_err(|e| format!("base64: {e}"))?;
+            let encrypted = state.borrow().is_encrypted(&wal_op.table);
+            let store_bytes =
+                crate::handler::maybe_encrypt(&wal_op.table, &wal_op.key, &value, encrypted);
             let rev = kv
-                .create(&wal_op.key, &value)
+                .create(&wal_op.key, &store_bytes)
                 .await
                 .map_err(|e| format!("{e}"))?;
             state
@@ -681,7 +687,14 @@ async fn rollback(state: &SharedState, store: &SharedStore, ops: &[WalOp]) -> Re
                         let old_value = B64
                             .decode(before_b64)
                             .map_err(|e| format!("rollback base64: {e}"))?;
-                        if let Ok(rev) = kv.put(&wal_op.key, &old_value).await {
+                        let encrypted = state.borrow().is_encrypted(&wal_op.table);
+                        let store_bytes = crate::handler::maybe_encrypt(
+                            &wal_op.table,
+                            &wal_op.key,
+                            &old_value,
+                            encrypted,
+                        );
+                        if let Ok(rev) = kv.put(&wal_op.key, &store_bytes).await {
                             state.borrow_mut().table(&wal_op.table).upsert(
                                 &wal_op.key,
                                 old_value,
@@ -701,7 +714,14 @@ async fn rollback(state: &SharedState, store: &SharedStore, ops: &[WalOp]) -> Re
                     let old_value = B64
                         .decode(before_b64)
                         .map_err(|e| format!("rollback base64: {e}"))?;
-                    if let Ok(rev) = kv.put(&wal_op.key, &old_value).await {
+                    let encrypted = state.borrow().is_encrypted(&wal_op.table);
+                    let store_bytes = crate::handler::maybe_encrypt(
+                        &wal_op.table,
+                        &wal_op.key,
+                        &old_value,
+                        encrypted,
+                    );
+                    if let Ok(rev) = kv.put(&wal_op.key, &store_bytes).await {
                         state
                             .borrow_mut()
                             .table(&wal_op.table)
@@ -735,8 +755,28 @@ async fn ensure_loaded(
             .map_err(|e| format!("load table: {e}"))?;
         let mut s = state.borrow_mut();
         let ts = s.table(table);
+        let encrypted = ts.encrypted;
         for entry in entries {
-            ts.upsert(&entry.key, entry.value, entry.revision);
+            let plaintext = if encrypted {
+                match crate::vault::decrypt(
+                    crate::handler::master_key(),
+                    table,
+                    &entry.key,
+                    &entry.value,
+                ) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!(
+                            "lattice-db: txn recovery decrypt failed {table}:{}: {e}",
+                            entry.key
+                        );
+                        continue;
+                    }
+                }
+            } else {
+                entry.value
+            };
+            ts.upsert(&entry.key, plaintext, entry.revision);
         }
         ts.loaded = true;
     }

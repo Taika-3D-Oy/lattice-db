@@ -1,5 +1,40 @@
 # Changelog
 
+## [1.9.0] - 2026-05-05
+
+### Added
+
+- **Per-table AES-256-GCM envelope encryption**: Tables opt in via
+  `"encrypted": true` in their schema. Values are stored as
+  `[1-byte version][12-byte nonce][AES-256-GCM ciphertext+tag]` in NATS KV.
+  The in-memory cache always holds plaintext so filters, indexes, scan,
+  aggregate, and count work unchanged.
+  - **Master key**: `LDB_MASTER_KEY` env var (hex or base64, ≥32 bytes).
+    In development, set `LDB_DEV_SEED` for a deterministic HKDF-derived key
+    (prints a warning on startup).
+  - **Per-table DEK**: HKDF-SHA256 with info `"table:{name}"`.
+  - **AAD**: `"{table}:{key}"` — binds ciphertext to its KV location.
+  - **Nonce**: 12 random bytes via `wasip3::random` per write.
+  - Wired into all write paths (`put`, `create`, `cas`, `batch.put`,
+    `schedule_fire`, txn `apply`/`rollback`) and all read paths
+    (`load_table_snapshot`, `reload_table_from_kv`, `run_table_watcher`,
+    WAL recovery).
+
+### Changed
+
+- **Dependency**: `wasip3` bumped from `0.5` to `0.6`, `wit-bindgen` from
+  `0.54` to `0.57` across all workspace crates (`storage-service`,
+  `lattice-sql`, `lattice-db-client`, `lattice-sql-client`).
+- **Direct `wit-bindgen` dependency removed** from all crates — re-exported
+  via `wasip3::wit_bindgen` and `wasip3::spawn` instead.
+
+### Fixed
+
+- **Linker duplicate symbol with `build-std`**: Added `--allow-multiple-definition`
+  to `rustflags` in `.cargo/config.toml`. Fixes the `duplicate symbol:
+  cabi_realloc_wit_bindgen_0_57_1` error caused by both `build-std`'s std and user
+  code compiling their own `wit-bindgen` static lib.
+
 ## [1.8.0] - 2026-05-04
 
 ### Added

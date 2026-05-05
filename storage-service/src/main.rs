@@ -11,6 +11,7 @@ mod store;
 mod tcp_server;
 mod tests;
 mod txn;
+pub mod vault;
 
 use nats_wasi::client::{Client, ConnectConfig};
 use nats_wasi::jetstream::JetStream;
@@ -155,8 +156,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let mut s = shared_state.borrow_mut();
                 for entry in &entries {
                     if let Ok(schema) = serde_json::from_slice::<serde_json::Value>(&entry.value) {
-                        s.table(&entry.key).schema = Some(schema);
-                        eprintln!("lattice-db: loaded schema for table {}", entry.key);
+                        let enc = schema
+                            .get("encrypted")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        let ts = s.table(&entry.key);
+                        ts.schema = Some(schema);
+                        ts.encrypted = enc;
+                        eprintln!(
+                            "lattice-db: loaded schema for table {} (encrypted={enc})",
+                            entry.key
+                        );
                     }
                 }
             }
@@ -165,7 +175,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             // stop schema propagation across replicas.
             let schema_state = shared_state.clone();
             let schema_kv_handle = kv.clone();
-            wit_bindgen::spawn(async move {
+            wasip3::spawn(async move {
                 let mut since = last_seq;
                 loop {
                     let watcher_res = if since == 0 {
@@ -200,16 +210,25 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 if let Ok(schema) =
                                     serde_json::from_slice::<serde_json::Value>(&entry.value)
                                 {
-                                    schema_state.borrow_mut().table(&table_name).schema =
-                                        Some(schema);
+                                    let enc = schema
+                                        .get("encrypted")
+                                        .and_then(|v| v.as_bool())
+                                        .unwrap_or(false);
+                                    let mut s = schema_state.borrow_mut();
+                                    let ts = s.table(&table_name);
+                                    ts.schema = Some(schema);
+                                    ts.encrypted = enc;
                                     eprintln!(
-                                        "lattice-db: schema updated for {table_name} (rev {})",
+                                        "lattice-db: schema updated for {table_name} (rev {}, encrypted={enc})",
                                         entry.revision
                                     );
                                 }
                             }
                             _ => {
-                                schema_state.borrow_mut().table(&table_name).schema = None;
+                                let mut s = schema_state.borrow_mut();
+                                let ts = s.table(&table_name);
+                                ts.schema = None;
+                                ts.encrypted = false;
                                 eprintln!("lattice-db: schema removed for {table_name}");
                             }
                         }
@@ -264,7 +283,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             // stop index propagation to newly scaled-up replicas.
             let index_state = shared_state.clone();
             let index_kv_handle = kv.clone();
-            wit_bindgen::spawn(async move {
+            wasip3::spawn(async move {
                 let mut since = last_seq;
                 loop {
                     let watcher_res = if since == 0 {
@@ -368,7 +387,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         let fire_store = shared_store.clone();
         let fire_client = data_client.clone();
         let fire_instance = instance.clone();
-        wit_bindgen::spawn(async move {
+        wasip3::spawn(async move {
             loop {
                 let Ok(msg) = fire_sub.next().await else {
                     break;
@@ -377,7 +396,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let fire_store = fire_store.clone();
                 let fire_client = fire_client.clone();
                 let fire_instance = fire_instance.clone();
-                wit_bindgen::spawn(async move {
+                wasip3::spawn(async move {
                     handler::handle_schedule_fire(
                         &fire_client,
                         &fire_store,
@@ -409,7 +428,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let cfg = config.clone();
             let state = shared_state.clone();
             let store = shared_store.clone();
-            wit_bindgen::spawn(async move {
+            wasip3::spawn(async move {
                 handler::handle(&msg_client, &js, &cfg, &state, &store, msg).await;
             });
         }

@@ -88,7 +88,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         let client = client.clone();
         let db_handle = LatticeDb::new(client.clone()).with_instance(instance.clone());
         let cat = shared_catalog.clone();
-        wit_bindgen::spawn(async move {
+        wasip3::spawn(async move {
             handler::handle(&client, &db_handle, &cat, msg).await;
         });
     }
