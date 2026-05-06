@@ -27,6 +27,7 @@
 
 use base64::Engine;
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::OnceLock;
@@ -160,6 +161,8 @@ struct ConsistencyReq {
 #[derive(Serialize)]
 struct SessionToken {
     revisions: HashMap<String, u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    epoch: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -812,13 +815,37 @@ async fn ensure_min_revision(
     }
 }
 
+// ── Data epoch ─────────────────────────────────────────────────────────────
+
+thread_local! {
+    /// Data epoch — updated at startup and by the `_meta` watcher whenever
+    /// any replica writes a new epoch (e.g. after a restore or fresh start).
+    static DATA_EPOCH: RefCell<String> = RefCell::new(String::new());
+}
+
+/// Update the in-memory epoch. Called from main.rs on startup and from the
+/// `_meta` KV watcher whenever the epoch changes.
+pub(crate) fn set_data_epoch(epoch: String) {
+    DATA_EPOCH.with(|e| *e.borrow_mut() = epoch);
+}
+
+fn data_epoch() -> Option<String> {
+    DATA_EPOCH.with(|e| {
+        let s = e.borrow();
+        if s.is_empty() { None } else { Some(s.clone()) }
+    })
+}
+
 fn session_for_table(table: &str, revision: u64) -> Option<SessionToken> {
     if revision == 0 {
         return None;
     }
     let mut revisions = HashMap::new();
     revisions.insert(table.to_string(), revision);
-    Some(SessionToken { revisions })
+    Some(SessionToken {
+        revisions,
+        epoch: data_epoch(),
+    })
 }
 
 /// Background loop that watches a KV bucket for changes from other replicas

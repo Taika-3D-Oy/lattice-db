@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.9.1] - 2026-05-05
+
+### Added
+
+- **Data epoch for consistency tokens**: On startup, each storage-service
+  replica writes a fresh random epoch to the `_meta` KV bucket (key `epoch`).
+  A KV watcher ensures all replicas converge to the latest epoch within
+  milliseconds. The epoch is included in every `session` response; clients
+  embed it in consistency cookies — when NATS data is wiped or restored to an
+  earlier point, the next startup rotates the epoch and stale cookies are
+  silently discarded instead of triggering "stale replica" errors.
+
 ## [1.9.0] - 2026-05-05
 
 ### Added

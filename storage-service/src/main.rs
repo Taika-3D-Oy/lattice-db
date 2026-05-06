@@ -122,6 +122,63 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     if auth_token.is_some() {
         eprintln!("lattice-db: auth token required (_auth field)");
     }
+
+    // Data epoch: a random identifier stored in `_meta` KV. Each replica
+    // writes a fresh epoch on startup; a KV watcher ensures all replicas
+    // converge to the latest epoch. After a data restore (or wipe) the next
+    // startup naturally rotates the epoch, invalidating stale cookies.
+    let meta_kv = store::get_or_create_kv(&shared_store, "_meta").await
+        .map_err(|e| format!("meta KV setup: {e}"))?;
+    {
+        let bytes = wasip3::random::random::get_random_bytes(8);
+        let epoch: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let _ = meta_kv.put("epoch", epoch.as_bytes()).await;
+        eprintln!("lattice-db: data epoch (written) = {epoch}");
+        handler::set_data_epoch(epoch);
+    }
+    // Watch `_meta` epoch key so all replicas converge when any peer starts.
+    {
+        let epoch_kv = meta_kv.clone();
+        wasip3::spawn(async move {
+            let mut since = 0u64;
+            loop {
+                let watcher_res = if since == 0 {
+                    epoch_kv.watch_all().await
+                } else {
+                    epoch_kv.watch_all_from_revision(since).await
+                };
+                let watcher = match watcher_res {
+                    Ok(w) => w,
+                    Err(e) => {
+                        eprintln!("lattice-db: _meta watcher setup failed: {e} — retrying");
+                        wasip3::clocks::monotonic_clock::wait_for(nats_wasi::client::secs(5))
+                            .await;
+                        continue;
+                    }
+                };
+                loop {
+                    let entry = match watcher.next().await {
+                        Ok(e) => e,
+                        Err(e) => {
+                            eprintln!(
+                                "lattice-db: _meta watcher disconnected: {e} — reconnecting"
+                            );
+                            break;
+                        }
+                    };
+                    since = entry.revision;
+                    if entry.key == "epoch" {
+                        if let nats_wasi::kv::Operation::Put = entry.operation {
+                            let new_epoch = String::from_utf8_lossy(&entry.value).to_string();
+                            eprintln!("lattice-db: data epoch updated = {new_epoch}");
+                            handler::set_data_epoch(new_epoch);
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     let config: handler::SharedConfig = Rc::new(handler::Config {
         auth_token,
         instance: instance.clone(),
