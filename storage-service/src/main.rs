@@ -17,22 +17,85 @@ use nats_wasi::client::{Client, ConnectConfig};
 use nats_wasi::jetstream::JetStream;
 use std::rc::Rc;
 
-// ── wasip3 command entry point ─────────────────────────────────────
+// ── wasi:cli/run Export ───────────────────────────────────────────
+struct Component;
+wasip3::cli::command::export!(Component);
 
-wasip3::cli::command::export!(LatticeDb);
-
-struct LatticeDb;
-
-impl wasip3::exports::cli::run::Guest for LatticeDb {
+impl wasip3::exports::cli::run::Guest for Component {
     async fn run() -> Result<(), ()> {
-        if let Err(e) = run().await {
-            eprintln!("fatal: {e}");
+        loop {
+            if let Err(e) = run_service().await {
+                eprintln!("storage-service error: {e} — restarting in 2s");
+                wasip3::clocks::monotonic_clock::wait_for(nats_wasi::client::secs(2)).await;
+            }
         }
-        Ok(())
     }
 }
 
-async fn run() -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) async fn dispatch_request(payload: &[u8]) -> Vec<u8> {
+    let (client, js, config, state, store) = get_shared();
+    tcp_server::dispatch(&client, &js, &config, &state, &store, payload).await
+}
+
+static INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+static mut SHARED_CTX: Option<(Client, JetStream, handler::SharedConfig, state::SharedState, store::SharedStore)> = None;
+
+fn get_shared() -> (Client, JetStream, handler::SharedConfig, state::SharedState, store::SharedStore) {
+    unsafe {
+        let (c, j, cfg, st, str) = SHARED_CTX.as_ref().expect("storage-service context not initialized");
+        (c.clone(), j.clone(), cfg.clone(), st.clone(), str.clone())
+    }
+}
+
+async fn ensure_initialized() {
+    if INIT.get().is_some() {
+        return;
+    }
+    if let Err(e) = init_service().await {
+        eprintln!("storage-service init failed: {e}");
+    } else {
+        let _ = INIT.set(());
+    }
+}
+
+async fn init_service() -> Result<(), Box<dyn std::error::Error>> {
+    let nats_data_url = std::env::var("NATS_DATA_URL")
+        .ok()
+        .or_else(|| std::env::var("NATS_URL").ok())
+        .or_else(|| std::env::args().nth(1))
+        .unwrap_or_else(|| "10.68.11.163:4222".to_string());
+
+    let use_tls = std::env::var("NATS_TLS").map_or(false, |v| v == "1" || v == "true");
+
+    let data_client = Client::connect(ConnectConfig {
+        address: nats_data_url.to_string(),
+        name: Some("lattice-db-host".to_string()),
+        tls: use_tls,
+        ..Default::default()
+    })
+    .await?;
+
+    let instance = std::env::var("LDB_INSTANCE").unwrap_or_else(|_| "lid".to_string());
+    let data_instance = std::env::var("LDB_DATA_INSTANCE").unwrap_or_else(|_| instance.clone());
+
+    let shared_state = state::new_shared_state();
+    let shared_store = store::new_shared_store(data_client.clone(), data_instance.clone());
+    let js = JetStream::new(data_client.clone());
+
+    let auth_token = std::env::var("LDB_AUTH_TOKEN").ok();
+    let config: handler::SharedConfig = Rc::new(handler::Config {
+        auth_token,
+        instance,
+        data_instance,
+    });
+
+    unsafe {
+        SHARED_CTX = Some((data_client, js, config, shared_state, shared_store));
+    }
+    Ok(())
+}
+
+async fn run_service() -> Result<(), Box<dyn std::error::Error>> {
     // Determine which transport modes are enabled.
     let nats_url = std::env::var("NATS_URL")
         .ok()
@@ -184,6 +247,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         instance: instance.clone(),
         data_instance: data_instance.clone(),
     });
+
+    // Start local TCP server for fast loopback requests (e.g. from oidc-gateway).
+    if tcp_port.is_some() {
+        eprintln!("lattice-db: starting TCP listener");
+        tcp_server::start(
+            data_client.clone(),
+            js.clone(),
+            config.clone(),
+            shared_state.clone(),
+            shared_store.clone(),
+        );
+    }
 
     // Set up WAL stream and recover incomplete transactions.
     txn::init_node_id();
@@ -423,16 +498,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Start TCP listener for localhost (workload-internal) access.
-    if tcp_port.is_some() {
-        tcp_server::start(
-            data_client.clone(),
-            js.clone(),
-            config.clone(),
-            shared_state.clone(),
-            shared_store.clone(),
-        );
-    }
+
 
     // Subscribe to fired schedule deliveries (NATS 2.14+ ADR-51).
     // The NATS server publishes here when a scheduled write's @at timestamp fires.

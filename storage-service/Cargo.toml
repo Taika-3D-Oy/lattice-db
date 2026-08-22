@@ -12,9 +12,10 @@ path = "src/main.rs"
 crate-type = ["cdylib"]
 
 [dependencies]
-nats-wasi = { package = "nats-wasip3", version = "0.11.0" }
-wasip3 = { version = "0.6", features = ["async-spawn"] }
-futures = { version = "0.3", default-features = false, features = ["alloc"] }
+wit-bindgen = { version = "0.57", default-features = false, features = ["macros", "async-spawn"] }
+nats-wasi = { package = "nats-wasip3", git = "https://github.com/Taika-3D-Oy/nats-wasip3.git" }
+wasip3 = { version = "0.7", features = ["async-spawn"] }
+futures = { version = "0.3", default-features = false, features = ["alloc", "executor"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = { version = "0.22", default-features = false, features = ["alloc"] }

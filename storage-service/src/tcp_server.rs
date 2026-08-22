@@ -60,11 +60,12 @@ async fn run_listener(
 
     let mut incoming: StreamReader<TcpSocket> =
         socket.listen().map_err(|e| format!("tcp listen: {e:?}"))?;
+    std::mem::forget(socket);
 
     eprintln!("lattice-db: tcp listening on 127.0.0.1:{port}");
 
     loop {
-        let read_buf = Vec::with_capacity(1);
+        let read_buf = Vec::with_capacity(16);
         let (status, sockets) = incoming.read(read_buf).await;
         match status {
             StreamResult::Complete(n) => {
@@ -74,7 +75,9 @@ async fn run_listener(
                     let cfg = config.clone();
                     let st = state.clone();
                     let sto = store.clone();
-                    handle_connection(conn, client, js, cfg, st, sto).await;
+                    wasip3::spawn(async move {
+                        handle_connection(conn, client, js, cfg, st, sto).await;
+                    });
                 }
             }
             StreamResult::Dropped | StreamResult::Cancelled => {
@@ -92,50 +95,53 @@ async fn handle_connection(
     state: SharedState,
     store: SharedStore,
 ) {
+    eprintln!("lattice-db: tcp connection accepted");
     let (mut rx, _rx_done) = conn.receive();
     let (mut tx, tx_rx) = wit_stream::new::<u8>();
-    let _send_fut = conn.send(tx_rx);
 
     let mut buf = Vec::new();
 
-    loop {
-        // Read until we have at least 4 bytes for the length prefix.
-        while buf.len() < 4 {
-            if stream_read_u8(&mut rx, &mut buf).await == 0 {
-                return; // Connection closed.
-            }
-        }
-
-        let len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
-        buf.drain(..4);
-
-        // Read until we have the full payload.
-        while buf.len() < len {
-            if stream_read_u8(&mut rx, &mut buf).await == 0 {
-                return; // Connection closed mid-frame.
-            }
-        }
-
-        let payload: Vec<u8> = buf.drain(..len).collect();
-
-        // Dispatch the request.
-        let resp_bytes = dispatch(&client, &js, &config, &state, &store, &payload).await;
-
-        // Write length-prefixed response.
-        let resp_len = (resp_bytes.len() as u32).to_be_bytes();
-        let mut frame = Vec::with_capacity(4 + resp_bytes.len());
-        frame.extend_from_slice(&resp_len);
-        frame.extend_from_slice(&resp_bytes);
-
-        let remaining = tx.write_all(frame).await;
-        if !remaining.is_empty() {
-            return; // Connection broken.
+    // Read 4-byte length prefix.
+    while buf.len() < 4 {
+        if stream_read_u8(&mut rx, &mut buf).await == 0 {
+            eprintln!("lattice-db: tcp connection closed before 4-byte length prefix");
+            return;
         }
     }
+    let len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    buf.drain(..4);
+
+    // Read full payload.
+    while buf.len() < len {
+        if stream_read_u8(&mut rx, &mut buf).await == 0 {
+            eprintln!("lattice-db: tcp connection closed mid-payload");
+            return;
+        }
+    }
+    let payload: Vec<u8> = buf.drain(..len).collect();
+    eprintln!("lattice-db: tcp payload: {}", String::from_utf8_lossy(&payload));
+
+    // Dispatch the request.
+    let resp_bytes = dispatch(&client, &js, &config, &state, &store, &payload).await;
+    eprintln!("lattice-db: tcp response: {}", String::from_utf8_lossy(&resp_bytes));
+
+    // Write length-prefixed response.
+    let resp_len = (resp_bytes.len() as u32).to_be_bytes();
+    let mut frame = Vec::with_capacity(4 + resp_bytes.len());
+    frame.extend_from_slice(&resp_len);
+    frame.extend_from_slice(&resp_bytes);
+
+    let _ = futures::join!(
+        async { conn.send(tx_rx).await },
+        async {
+            tx.write_all(frame).await;
+            drop(tx);
+        }
+    );
 }
 
-/// Dispatch a TCP request. The payload is JSON with an `_op` field.
-async fn dispatch(
+/// Dispatch a request. The payload is JSON with an `_op` field.
+pub(crate) async fn dispatch(
     client: &Client,
     js: &JetStream,
     config: &SharedConfig,
