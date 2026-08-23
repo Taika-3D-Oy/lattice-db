@@ -101,9 +101,12 @@ async fn run_service() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .or_else(|| std::env::args().nth(1));
     let nats_data_url = std::env::var("NATS_DATA_URL").ok();
-    let tcp_port = std::env::var("LDB_TCP_PORT")
-        .ok()
-        .and_then(|v| v.parse::<u16>().ok());
+    let tcp_port = Some(
+        std::env::var("LDB_TCP_PORT")
+            .ok()
+            .and_then(|v| v.parse::<u16>().ok())
+            .unwrap_or(4080),
+    );
 
     // At least one of NATS messaging or TCP must be enabled.
     if nats_url.is_none() && tcp_port.is_none() {

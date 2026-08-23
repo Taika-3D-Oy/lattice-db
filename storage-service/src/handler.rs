@@ -677,6 +677,10 @@ async fn load_table_snapshot(
     let status = kv.status().await.map_err(|e| format!("load table: {e}"))?;
     let last_seq = status.last_seq;
 
+    if status.values == 0 {
+        return Ok((Vec::new(), last_seq));
+    }
+
     // Use the consumer-based load_all (nats-wasip3 ≥ 0.8.2) which fetches in
     // batches using DeliverPolicy::LastPerSubject — O(keys) not O(stream_seq).
     let raw_entries = kv

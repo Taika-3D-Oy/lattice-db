@@ -138,6 +138,8 @@ async fn handle_connection(
             drop(tx);
         }
     );
+    drop(conn);
+    drop(_rx_done);
 }
 
 /// Dispatch a request. The payload is JSON with an `_op` field.

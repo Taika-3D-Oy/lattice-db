@@ -311,7 +311,7 @@ version = "1.9.1"
 dependencies = [
  "base64",
  "futures",
- "nats-wasip3 0.11.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "nats-wasip3 0.11.1",
  "serde",
  "serde_json",
  "wasip3 0.6.0+wasi-0.3.0-rc-2026-03-15",
@@ -322,7 +322,7 @@ name = "lattice-sql"
 version = "1.9.1"
 dependencies = [
  "lattice-db-client",
- "nats-wasip3 0.11.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "nats-wasip3 0.11.1",
  "serde",
  "serde_json",
  "sqlparser",
@@ -370,8 +370,8 @@ dependencies = [
 
 [[package]]
 name = "nats-wasip3"
-version = "0.11.1"
-source = "git+https://github.com/Taika-3D-Oy/nats-wasip3.git#4ed263ec04fd3763225d5d34ffc7d11c3c4a3e28"
+version = "0.11.3"
+source = "git+https://github.com/Taika-3D-Oy/nats-wasip3.git#ce6441e4d708aa54ba72b855d41eb4cff6b9443b"
 dependencies = [
  "base64",
  "futures",
@@ -511,13 +511,13 @@ dependencies = [
 
 [[package]]
 name = "storage-service"
-version = "1.9.1"
+version = "1.10.0"
 dependencies = [
  "aes-gcm",
  "base64",
  "futures",
  "hkdf",
- "nats-wasip3 0.11.1 (git+https://github.com/Taika-3D-Oy/nats-wasip3.git)",
+ "nats-wasip3 0.11.3",
  "serde",
  "serde_json",
  "sha2",

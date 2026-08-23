@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.10.0] - 2026-08-22
+
+### Added
+
+- **wasmCloud 2.7.0 Service Lifecycle**:
+  - Exported standard `wasi:cli/run@0.3.0` via `wasip3::cli::command::export!(Component)` for native wasmCloud workload service management.
+  - Added localhost TCP listener on `127.0.0.1:4080` for sub-millisecond co-located workload communication.
+  - Integrated `wasip3 0.7` and `nats-wasip3 0.11.2`.
+
 ## [1.9.1] - 2026-05-05
 
 ### Added
