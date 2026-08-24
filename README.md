@@ -263,22 +263,26 @@ bash tests/integration.sh --tls       # against the Kind cluster with mTLS
 
 Requires `nats` CLI, `jq`, `base64`. See [TESTING.md](TESTING.md) for Kubernetes setup.
 
-## Running the benchmark
+## Building and Running the Benchmark
 
 ```bash
-cargo build --target wasm32-wasip3 --release --example bench -p lattice-db-client
+# Build storage-service (works with stable Rust on wasm32-wasip2)
+cargo build --target wasm32-wasip2 --release -p storage-service
+
+# Build benchmark client
+cargo build --target wasm32-wasip2 --release --example bench -p lattice-db-client
 
 nats-server -js -p 14222 &
-wasmtime run -S p3=y -S inherit-network=y -W component-model-async=y \
+wasmtime run -S inherit-network=y -W component-model-async=y \
   --env NATS_URL=127.0.0.1:14222 \
-  target/wasm32-wasip3/release/storage_service.wasm &
+  target/wasm32-wasip2/release/storage_service.wasm &
 
-wasmtime run -S p3=y -S inherit-network=y -W component-model-async=y \
+wasmtime run -S inherit-network=y -W component-model-async=y \
   --env NATS_URL=127.0.0.1:14222 \
   --env BENCH_DURATION_SECS=10 \
   --env BENCH_CONCURRENCY=64 \
   --env BENCH_TXN_CONCURRENCY=8 \
-  target/wasm32-wasip3/release/examples/bench.wasm
+  target/wasm32-wasip2/release/examples/bench.wasm
 ```
 
 Tunables: `BENCH_DURATION_SECS` (10), `BENCH_CONCURRENCY` (64), `BENCH_TXN_CONCURRENCY` (8), `BENCH_MSG_SIZE` (256), `BENCH_TABLES` (8), `BENCH_TXN_OPS` (2).

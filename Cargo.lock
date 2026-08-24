@@ -311,7 +311,7 @@ version = "1.9.1"
 dependencies = [
  "base64",
  "futures",
- "nats-wasip3 0.11.1",
+ "nats-wasip3 0.11.2",
  "serde",
  "serde_json",
  "wasip3 0.6.0+wasi-0.3.0-rc-2026-03-15",
@@ -322,7 +322,7 @@ name = "lattice-sql"
 version = "1.9.1"
 dependencies = [
  "lattice-db-client",
- "nats-wasip3 0.11.1",
+ "nats-wasip3 0.11.2",
  "serde",
  "serde_json",
  "sqlparser",
@@ -355,16 +355,16 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "nats-wasip3"
-version = "0.11.1"
+version = "0.11.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "309563c9e19b2fd909095f6a5b56dab0bfbbaed43fee07616ea24100e9c5cbac"
+checksum = "556496373ed58d1c4152ef0a27a402880944a6c16e82dc4a600a36c2ab281180"
 dependencies = [
  "base64",
  "futures",
  "serde",
  "serde_json",
  "sha2",
- "wasip3 0.6.0+wasi-0.3.0-rc-2026-03-15",
+ "wasip3 0.7.1+wasi-0.3.0",
  "wit-bindgen",
 ]
 

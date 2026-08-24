@@ -75,9 +75,7 @@ async fn run_listener(
                     let cfg = config.clone();
                     let st = state.clone();
                     let sto = store.clone();
-                    wasip3::spawn(async move {
-                        handle_connection(conn, client, js, cfg, st, sto).await;
-                    });
+                    handle_connection(conn, client, js, cfg, st, sto).await;
                 }
             }
             StreamResult::Dropped | StreamResult::Cancelled => {
@@ -97,7 +95,6 @@ async fn handle_connection(
 ) {
     eprintln!("lattice-db: tcp connection accepted");
     let (mut rx, _rx_done) = conn.receive();
-    let (mut tx, tx_rx) = wit_stream::new::<u8>();
 
     let mut buf = Vec::new();
 
@@ -131,15 +128,18 @@ async fn handle_connection(
     frame.extend_from_slice(&resp_len);
     frame.extend_from_slice(&resp_bytes);
 
-    let _ = futures::join!(
-        async { conn.send(tx_rx).await },
-        async {
-            tx.write_all(frame).await;
-            drop(tx);
-        }
-    );
-    drop(conn);
+    let (mut tx, tx_rx) = wit_stream::new::<u8>();
+    let _send_fut = conn.send(tx_rx);
+    std::mem::forget(_send_fut);
+
+    tx.write_all(frame).await;
+    drop(tx);
+    drop(rx);
     drop(_rx_done);
+    drop(conn);
+
+    // Yield to the WASI host event loop to flush the send stream to the OS socket.
+    wasip3::clocks::monotonic_clock::wait_for(1_000_000).await;
 }
 
 /// Dispatch a request. The payload is JSON with an `_op` field.
