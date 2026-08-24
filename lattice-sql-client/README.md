@@ -6,9 +6,9 @@ Sends SQL strings to the `ldb.sql.query` NATS subject (where `ldb` is your `LDB_
 
 ## Requirements
 
-- **Target**: `wasm32-wasip3` (Component Model async I/O)
-- **Toolchain**: Rust nightly with `-Zbuild-std`
-- **Runtime**: [wasmCloud](https://wasmcloud.com) ≥ 2.0, or [Wasmtime](https://wasmtime.dev) ≥ 45
+- **Target**: `wasm32-wasip2` (WASI 0.3 Component Model async I/O)
+- **Toolchain**: Rust stable ≥ 1.85
+- **Runtime**: [wasmCloud](https://wasmcloud.com) ≥ 2.7.0, or [Wasmtime](https://wasmtime.dev) ≥ 47
 - **Services**: A running `storage-service` __and__ a running `lattice-sql` instance, both connected to NATS
 
 ## Quick start
@@ -17,8 +17,8 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-lattice-sql-client = "1.0"
-nats-wasip3 = "0.8.2"
+lattice-sql-client = "1.10.1"
+nats-wasip3 = "0.11.3"
 ```
 
 ```rust
@@ -149,7 +149,7 @@ pub enum Error {
 
 ```sh
 cd lattice-sql-client
-cargo build --target wasm32-wasip3 -Zbuild-std=std,panic_abort
+cargo build --target wasm32-wasip2
 ```
 
 ## Running the smoke test
@@ -157,17 +157,17 @@ cargo build --target wasm32-wasip3 -Zbuild-std=std,panic_abort
 ```sh
 # Start dependencies
 nats-server -js -p 14222 &
-wasmtime run --inherit-network --env NATS_URL=127.0.0.1:14222 \
-  target/wasm32-wasip3/release/storage-service.wasm &
-wasmtime run -S p3=y -S inherit-network=y -W component-model=y -W component-model-async=y \
+wasmtime run -S inherit-network=y -W component-model-async=y --env NATS_URL=127.0.0.1:14222 \
+  target/wasm32-wasip2/release/storage-service.wasm &
+wasmtime run -S inherit-network=y -W component-model-async=y \
   --env NATS_URL=127.0.0.1:14222 \
-  ../target/wasm32-wasip3/release/lattice-sql.wasm &
+  ../target/wasm32-wasip2/release/lattice-sql.wasm &
 
 # Build and run
-cargo build --target wasm32-wasip3 --example smoke_test
-wasmtime run -S p3=y -S inherit-network=y -W component-model=y -W component-model-async=y \
+cargo build --target wasm32-wasip2 --example smoke_test
+wasmtime run -S inherit-network=y -W component-model-async=y \
   --env NATS_URL=127.0.0.1:14222 \
-  target/wasm32-wasip3/debug/examples/smoke_test.wasm
+  target/wasm32-wasip2/debug/examples/smoke_test.wasm
 ```
 
 ## Integration tests

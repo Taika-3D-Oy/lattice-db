@@ -116,16 +116,16 @@ let db = LatticeDb::new(client)
 
 ## Build & run
 
-Requires Rust nightly (the `rust-toolchain.toml` pins it). Output is `target/wasm32-wasip3/release/storage_service.wasm` (663 KB).
+Builds with stable Rust targeting `wasm32-wasip2`. Output is `target/wasm32-wasip2/release/storage_service.wasm`.
 
 ```bash
-cargo build --release
+cargo build --target wasm32-wasip2 --release
 
 # Run with wasmtime against a local NATS server
 nats-server -js -p 14222 &
-wasmtime run -S p3=y -S inherit-network=y -W component-model-async=y \
+wasmtime run -S inherit-network=y -W component-model-async=y \
   --env NATS_URL=127.0.0.1:14222 \
-  target/wasm32-wasip3/release/storage_service.wasm
+  target/wasm32-wasip2/release/storage_service.wasm
 ```
 
 For a full Kind + wasmCloud + mTLS local environment:
@@ -136,7 +136,7 @@ bash deploy/deploy-local.sh rebuild   # rebuild service only
 bash deploy/deploy-local.sh teardown
 ```
 
-Prerequisites: `kind`, `kubectl`, `helm`, `docker`, `cargo`, `wash`. The wasmCloud host must have wasip3 enabled (`wash host --wasip3`).
+Prerequisites: `kind`, `kubectl`, `helm`, `docker`, `cargo`, `wash`. Runtime requirement: wasmCloud ≥ 2.7.0 or Wasmtime ≥ 47.
 
 For a public-registry deployment, push `storage_service.wasm` to OCI and apply [`deploy/workloaddeployment-public.yaml`](deploy/workloaddeployment-public.yaml).
 
@@ -309,7 +309,7 @@ tests/              # integration test suites
 |---|---|
 | `storage-service` | The database service |
 | [`lattice-db-client`](lattice-db-client/) | Typed Rust SDK |
-| [`nats-wasip3`](https://crates.io/crates/nats-wasip3) | NATS client for `wasm32-wasip3` (published separately) |
+| [`nats-wasip3`](https://crates.io/crates/nats-wasip3) | NATS client for WASI 0.3 / `wasm32-wasip2` (published separately) |
 
 ## License
 

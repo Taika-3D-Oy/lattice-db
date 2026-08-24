@@ -6,9 +6,9 @@ Wraps the NATS request/reply wire protocol so you can call `put`, `get`, `scan`,
 
 ## Requirements
 
-- **Target**: `wasm32-wasip3` (Component Model async I/O)
-- **Toolchain**: Rust nightly with `-Zbuild-std`
-- **Runtime**: [wasmCloud](https://wasmcloud.com) ≥ 2.0 with wasip3 support, or [Wasmtime](https://wasmtime.dev) ≥ 43
+- **Target**: `wasm32-wasip2` (WASI 0.3 Component Model async I/O)
+- **Toolchain**: Rust stable ≥ 1.85
+- **Runtime**: [wasmCloud](https://wasmcloud.com) ≥ 2.7.0, or [Wasmtime](https://wasmtime.dev) ≥ 47
 - **NATS**: A running NATS server with JetStream enabled
 
 ## Quick start
@@ -17,8 +17,8 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-lattice-db-client = "1.6"
-nats-wasip3 = "0.8.2"
+lattice-db-client = "1.10.1"
+nats-wasip3 = "0.11.3"
 ```
 
 ```rust
@@ -108,7 +108,7 @@ The instance name (default `"ldb"`) must match the server's `LDB_INSTANCE` confi
 ## Building
 
 ```sh
-cargo build --target wasm32-wasip3 -Zbuild-std=std,panic_abort
+cargo build --target wasm32-wasip2
 ```
 
 ## License

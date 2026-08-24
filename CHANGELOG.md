@@ -1,5 +1,21 @@
 # Changelog
 
+## [1.10.1] - 2026-08-24
+
+### Changed
+
+- **Stable Rust & WASI 0.3 Build Support**:
+  - Migrated build toolchain and documentation to stable Rust (`wasm32-wasip2` target).
+  - Synchronized dependencies across all workspace and client crates (`storage-service`, `lattice-sql`, `lattice-db-client`, `lattice-sql-client`) to `wasip3 0.7` and `nats-wasip3 0.11.3`.
+  - Updated runtime requirements to Wasmtime ≥ 47 / wasmCloud ≥ 2.7.0.
+
+### Fixed
+
+- **TCP Server Concurrency**:
+  - Executed TCP `handle_connection` inline to prevent deadlock under concurrency.
+- **Snapshot Fast-Path**:
+  - Fast-pathed empty table snapshots during initial table loading.
+
 ## [1.10.0] - 2026-08-22
 
 ### Added

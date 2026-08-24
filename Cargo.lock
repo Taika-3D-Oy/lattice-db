@@ -307,26 +307,26 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "lattice-db-client"
-version = "1.9.1"
+version = "1.10.1"
 dependencies = [
  "base64",
  "futures",
- "nats-wasip3 0.11.2",
+ "nats-wasip3",
  "serde",
  "serde_json",
- "wasip3 0.6.0+wasi-0.3.0-rc-2026-03-15",
+ "wasip3",
 ]
 
 [[package]]
 name = "lattice-sql"
-version = "1.9.1"
+version = "1.10.1"
 dependencies = [
  "lattice-db-client",
- "nats-wasip3 0.11.2",
+ "nats-wasip3",
  "serde",
  "serde_json",
  "sqlparser",
- "wasip3 0.6.0+wasi-0.3.0-rc-2026-03-15",
+ "wasip3",
 ]
 
 [[package]]
@@ -355,21 +355,6 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "nats-wasip3"
-version = "0.11.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "556496373ed58d1c4152ef0a27a402880944a6c16e82dc4a600a36c2ab281180"
-dependencies = [
- "base64",
- "futures",
- "serde",
- "serde_json",
- "sha2",
- "wasip3 0.7.1+wasi-0.3.0",
- "wit-bindgen",
-]
-
-[[package]]
-name = "nats-wasip3"
 version = "0.11.3"
 source = "git+https://github.com/Taika-3D-Oy/nats-wasip3.git#ce6441e4d708aa54ba72b855d41eb4cff6b9443b"
 dependencies = [
@@ -378,7 +363,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "wasip3 0.7.1+wasi-0.3.0",
+ "wasip3",
  "wit-bindgen",
 ]
 
@@ -511,17 +496,17 @@ dependencies = [
 
 [[package]]
 name = "storage-service"
-version = "1.10.0"
+version = "1.10.1"
 dependencies = [
  "aes-gcm",
  "base64",
  "futures",
  "hkdf",
- "nats-wasip3 0.11.3",
+ "nats-wasip3",
  "serde",
  "serde_json",
  "sha2",
- "wasip3 0.7.1+wasi-0.3.0",
+ "wasip3",
  "wit-bindgen",
 ]
 
@@ -586,15 +571,6 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
-
-[[package]]
-name = "wasip3"
-version = "0.6.0+wasi-0.3.0-rc-2026-03-15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ed83456dd6a0b8581998c0365e4651fa2997e5093b49243b7f35391afaa7a3d9"
-dependencies = [
- "wit-bindgen",
-]
 
 [[package]]
 name = "wasip3"

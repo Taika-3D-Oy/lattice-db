@@ -1,6 +1,6 @@
 [package]
 name = "storage-service"
-version = "1.10.0"
+version = "1.10.1"
 edition = "2021"
 description = "Self-contained distributed database service — connects to NATS, serves requests, persists to KV"
 license = "Apache-2.0"
@@ -13,7 +13,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 wit-bindgen = { version = "0.57", default-features = false, features = ["macros", "async-spawn"] }
-nats-wasi = { package = "nats-wasip3", git = "https://github.com/Taika-3D-Oy/nats-wasip3.git" }
+nats-wasi = { package = "nats-wasip3", version = "0.11.3", git = "https://github.com/Taika-3D-Oy/nats-wasip3.git" }
 wasip3 = { version = "0.7", features = ["async-spawn"] }
 futures = { version = "0.3", default-features = false, features = ["alloc", "executor"] }
 serde = { version = "1", features = ["derive"] }
