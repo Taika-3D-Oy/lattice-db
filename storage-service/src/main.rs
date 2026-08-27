@@ -58,6 +58,55 @@ async fn ensure_initialized() {
     }
 }
 
+fn get_env_opt(keys: &[&str]) -> Option<String> {
+    for k in keys {
+        if let Ok(v) = std::env::var(k) {
+            let trimmed = v.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn build_connect_config(address: String, name: &str, use_tls: bool, is_data: bool) -> ConnectConfig {
+    let user = if is_data {
+        get_env_opt(&["NATS_DATA_USER", "NATS_USER"])
+    } else {
+        get_env_opt(&["NATS_MSG_USER", "NATS_USER"])
+    };
+
+    let pass = if is_data {
+        get_env_opt(&["NATS_DATA_PASSWORD", "NATS_PASSWORD", "NATS_DATA_PASS", "NATS_PASS"])
+    } else {
+        get_env_opt(&["NATS_MSG_PASSWORD", "NATS_PASSWORD", "NATS_MSG_PASS", "NATS_PASS"])
+    };
+
+    let auth_token = if is_data {
+        get_env_opt(&["NATS_DATA_AUTH_TOKEN", "NATS_AUTH_TOKEN", "NATS_DATA_TOKEN", "NATS_TOKEN"])
+    } else {
+        get_env_opt(&["NATS_MSG_AUTH_TOKEN", "NATS_AUTH_TOKEN", "NATS_MSG_TOKEN", "NATS_TOKEN"])
+    };
+
+    let jwt = if is_data {
+        get_env_opt(&["NATS_DATA_JWT", "NATS_JWT"])
+    } else {
+        get_env_opt(&["NATS_MSG_JWT", "NATS_JWT"])
+    };
+
+    ConnectConfig {
+        address,
+        name: Some(name.to_string()),
+        user,
+        pass,
+        auth_token,
+        jwt,
+        tls: use_tls,
+        ..Default::default()
+    }
+}
+
 async fn init_service() -> Result<(), Box<dyn std::error::Error>> {
     let nats_data_url = std::env::var("NATS_DATA_URL")
         .ok()
@@ -67,12 +116,12 @@ async fn init_service() -> Result<(), Box<dyn std::error::Error>> {
 
     let use_tls = std::env::var("NATS_TLS").map_or(false, |v| v == "1" || v == "true");
 
-    let data_client = Client::connect(ConnectConfig {
-        address: nats_data_url.to_string(),
-        name: Some("lattice-db-host".to_string()),
-        tls: use_tls,
-        ..Default::default()
-    })
+    let data_client = Client::connect(build_connect_config(
+        nats_data_url.to_string(),
+        "lattice-db-host",
+        use_tls,
+        true,
+    ))
     .await?;
 
     let instance = std::env::var("LDB_INSTANCE").unwrap_or_else(|_| "lid".to_string());
@@ -130,12 +179,12 @@ async fn run_service() -> Result<(), Box<dyn std::error::Error>> {
 
     // Connect to NATS for data (always needed for JetStream KV).
     eprintln!("lattice-db: connecting to NATS (data) at {nats_data_addr}");
-    let data_client = Client::connect(ConnectConfig {
-        address: nats_data_addr.to_string(),
-        name: Some("lattice-db-data".to_string()),
-        tls: use_tls,
-        ..Default::default()
-    })
+    let data_client = Client::connect(build_connect_config(
+        nats_data_addr.to_string(),
+        "lattice-db-data",
+        use_tls,
+        true,
+    ))
     .await?;
 
     // Connect to NATS for messaging (req/reply) — only if NATS_URL is set.
@@ -146,12 +195,12 @@ async fn run_service() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             eprintln!("lattice-db: connecting to NATS (messaging) at {nats_msg_addr}");
             Some(
-                Client::connect(ConnectConfig {
-                    address: nats_msg_addr.to_string(),
-                    name: Some("lattice-db-msg".to_string()),
-                    tls: use_tls,
-                    ..Default::default()
-                })
+                Client::connect(build_connect_config(
+                    nats_msg_addr.to_string(),
+                    "lattice-db-msg",
+                    use_tls,
+                    false,
+                ))
                 .await?,
             )
         }
