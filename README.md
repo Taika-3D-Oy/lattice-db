@@ -2,21 +2,22 @@
 
 A distributed database that lives entirely inside NATS.
 
-The engine is a 663 KB `wasm32-wasip3` component. It connects to NATS, subscribes to `ldb.>` in a queue group, persists every table to its own JetStream KV bucket, and serves all CRUD, query, index, and transaction traffic over NATS request/reply.
+The engine is a `wasm32-wasip3` component that implements the official **NATS Microservices Framework (ADR-32)**. It connects to NATS, registers endpoints under its service group in a queue group, persists every table to its own JetStream KV bucket, and serves all CRUD, query, index, and transaction traffic over standardized NATS microservice request/reply.
 
 ```
-clients ──NATS req/rep──▶ storage-service (Wasm component, 663 KB)
-                                │
-co-located ──TCP :4080──▶       │
-  components                    │
-                          NATS JetStream KV
-                          (one bucket per table: ldb-{table})
+clients ──NATS ADR-32 req/rep──▶ storage-service (Wasm component)
+                                       │
+co-located ──TCP :4080─────────▶       │
+  components                           │
+                                 NATS JetStream KV
+                                 (one bucket per table: ldb-{table})
 ```
 
+- **NATS ADR-32 Microservice Architecture.** Discovered and monitored via standard NATS tooling (`nats service ls`, `nats service info`, `nats service stats`, `nats service ping`).
 - **JetStream KV as the storage layer.** Tables are buckets. No other persistent state.
 - **Cross-replica cache coherence via KV watchers.** Every replica keeps a local in-memory cache and invalidates entries by subscribing to the bucket's change stream.
 - **Multi-key transactions on top of a JetStream WAL stream.** A dedicated `ldb-txn` stream records PREPARE → apply → COMMIT/ABORT. Crash recovery walks the WAL on startup with a 30-second grace window and a per-txn lock bucket so multiple replicas can recover safely without stepping on each other.
-- **Horizontal scaling via NATS queue groups.** All replicas join `ldb-workers`; NATS distributes requests across them. Add a replica → reads scale linearly.
+- **Horizontal scaling via NATS queue groups.** All replicas join `{instance}-workers`; NATS distributes requests across them. Add a replica → reads scale linearly.
 - **Stateless components.** A replica can crash, restart, scale up, or scale down without any data migration. The state is in JetStream.
 
 ## Performance
@@ -155,21 +156,23 @@ When running on wasmCloud v2, you can deploy `storage-service` as a **co-located
 
 ### Wire protocol
 
-The TCP protocol is identical to the NATS JSON bodies, wrapped in a length-prefixed frame:
+The TCP protocol uses framed commands matching the NATS ADR-32 endpoint dispatch:
 
+**Request frame:**
 ```
-┌──────────────┬──────────────────────────────────┐
-│ 4 bytes (BE) │          JSON payload             │
-│  body length │  (same as NATS, with _op field)   │
-└──────────────┴──────────────────────────────────┘
+┌──────────────┬────────────┬──────────────────┬────────────────────────┐
+│ 4 bytes (BE) │ 1 byte     │ op bytes (UTF-8) │ JSON payload bytes     │
+│ total length │ op length  │ (e.g. "get")     │ (e.g. {"table":".."})  │
+└──────────────┴────────────┴──────────────────┴────────────────────────┘
 ```
 
-The JSON body must include an `_op` field corresponding to the NATS subject suffix:
-
-```json
-{"_op": "get", "table": "users", "key": "user-123"}
-{"_op": "put", "table": "users", "key": "user-123", "value": {"name": "Alice"}}
-{"_op": "scan", "table": "sessions", "filters": {"user_id": {"eq": "user-123"}}}
+**Response frame:**
+```
+┌──────────────┬──────────────────┬─────────────────────────────────────┐
+│ 4 bytes (BE) │ 2 bytes (BE)     │ Response payload bytes              │
+│ total length │ status code      │ (JSON result if 0, error if != 0)   │
+│              │ (0 = OK)         │                                     │
+└──────────────┴──────────────────┴─────────────────────────────────────┘
 ```
 
 ### Configuration
@@ -178,7 +181,7 @@ The JSON body must include an `_op` field corresponding to the NATS subject suff
 |---|---|---|
 | `LDB_TCP_PORT` | `4080` | Port to listen on (localhost only) |
 
-The TCP listener runs alongside the NATS subscription loop. All existing NATS-based operations (`get`, `put`, `cas`, `scan`, `txn`, etc.) work over TCP with the same JSON format — just add `"_op": "..."` to specify the operation.
+The TCP listener runs alongside the NATS ADR-32 microservice endpoints. All database operations (`get`, `put`, `cas`, `scan`, `txn`, etc.) execute identically with zero overhead.
 
 ### Deployment example (WorkloadDeployment)
 
@@ -209,10 +212,7 @@ The service runs as a sidecar — one long-lived process that all component inst
 use wasi::sockets::types::{IpAddressFamily, IpSocketAddress, Ipv4SocketAddress, TcpSocket};
 
 async fn ldb_request(op: &str, payload: &serde_json::Value) -> Result<serde_json::Value, String> {
-    let mut payload = payload.clone();
-    payload.as_object_mut().unwrap()
-        .insert("_op".into(), serde_json::Value::String(op.into()));
-    let body = serde_json::to_vec(&payload).unwrap();
+    let body = serde_json::to_vec(payload).map_err(|e| e.to_string())?;
 
     // Connect to co-located storage-service
     let socket = TcpSocket::create(IpAddressFamily::Ipv4).unwrap();
@@ -223,13 +223,18 @@ async fn ldb_request(op: &str, payload: &serde_json::Value) -> Result<serde_json
     let (mut tx, tx_rx) = wit_stream::new::<u8>();
     let _send = socket.send(tx_rx);
 
-    // Write: [4-byte BE length][JSON body]
-    let mut frame = Vec::with_capacity(4 + body.len());
-    frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    // Write: [4-byte total_len][1-byte op_len][op bytes][payload]
+    let op_bytes = op.as_bytes();
+    let total_len = (1 + op_bytes.len() + body.len()) as u32;
+    let mut frame = Vec::with_capacity(4 + 1 + op_bytes.len() + body.len());
+    frame.extend_from_slice(&total_len.to_be_bytes());
+    frame.push(op_bytes.len() as u8);
+    frame.extend_from_slice(op_bytes);
     frame.extend_from_slice(&body);
     tx.write_all(frame).await;
+    drop(tx);
 
-    // Read response: [4-byte BE length][JSON body]
+    // Read: 4-byte total_len + 2-byte status_code + response body
     let mut buf = Vec::new();
     while buf.len() < 4 {
         let (status, data) = rx.read(Vec::with_capacity(4096)).await;
@@ -239,9 +244,9 @@ async fn ldb_request(op: &str, payload: &serde_json::Value) -> Result<serde_json
             _ => return Err("read error".into()),
         }
     }
-    let resp_len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    let total_resp_len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
     buf.drain(..4);
-    while buf.len() < resp_len {
+    while buf.len() < total_resp_len {
         let (status, data) = rx.read(Vec::with_capacity(4096)).await;
         match status {
             StreamResult::Complete(0) => return Err("eof".into()),
@@ -250,7 +255,13 @@ async fn ldb_request(op: &str, payload: &serde_json::Value) -> Result<serde_json
         }
     }
 
-    serde_json::from_slice(&buf[..resp_len]).map_err(|e| e.to_string())
+    let status_code = u16::from_be_bytes([buf[0], buf[1]]);
+    let resp_payload = &buf[2..total_resp_len];
+    let val: serde_json::Value = serde_json::from_slice(resp_payload).map_err(|e| e.to_string())?;
+    if status_code != 0 {
+        return Err(val.get("error").and_then(|v| v.as_str()).unwrap_or("error").to_string());
+    }
+    Ok(val)
 }
 ```
 

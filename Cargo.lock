@@ -355,8 +355,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "nats-wasip3"
-version = "0.11.3"
-source = "git+https://github.com/Taika-3D-Oy/nats-wasip3.git#ce6441e4d708aa54ba72b855d41eb4cff6b9443b"
+version = "0.12.0"
 dependencies = [
  "base64",
  "futures",

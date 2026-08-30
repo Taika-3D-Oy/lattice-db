@@ -15,6 +15,7 @@ pub mod vault;
 
 use nats_wasi::client::{Client, ConnectConfig};
 use nats_wasi::jetstream::JetStream;
+use nats_wasi::service::{EndpointConfig, Service, ServiceConfig};
 use std::rc::Rc;
 
 // ── wasi:cli/run Export ───────────────────────────────────────────
@@ -34,7 +35,8 @@ impl wasip3::exports::cli::run::Guest for Component {
 
 pub(crate) async fn dispatch_request(payload: &[u8]) -> Vec<u8> {
     let (client, js, config, state, store) = get_shared();
-    tcp_server::dispatch(&client, &js, &config, &state, &store, payload).await
+    let (_status, body) = tcp_server::dispatch(&client, &js, &config, &state, &store, payload).await;
+    body
 }
 
 static INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
@@ -586,26 +588,87 @@ async fn run_service() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // Subscribe to all lattice-db operations (queue group for scaling).
+    // Subscribe to all lattice-db operations as an ADR-32 Microservice.
     if let Some(ref client) = msg_client {
-        let sub_subject = format!("{instance}.>");
         let queue_group = format!("{instance}-workers");
-        let sub = client.subscribe_queue(&sub_subject, &queue_group)?;
+        let service_config = ServiceConfig::new(instance.clone(), env!("CARGO_PKG_VERSION"))
+            .description("NATS-native distributed database")
+            .queue_group(&queue_group)
+            .metadata("instance", &instance)
+            .metadata("data_instance", &data_instance);
 
-        eprintln!("lattice-db: listening on {sub_subject} (queue group: {queue_group})");
+        let service = Service::add(client.clone(), service_config).await?;
+        let group = service.group(&instance);
 
-        loop {
-            let msg = sub.next().await?;
+        let endpoints = [
+            "get",
+            "put",
+            "delete",
+            "cas",
+            "cas_delete",
+            "purge",
+            "get_revision",
+            "create",
+            "exists",
+            "keys",
+            "scan",
+            "count",
+            "index.create",
+            "index.drop",
+            "index.list",
+            "txn",
+            "batch.get",
+            "batch.put",
+            "aggregate",
+            "schema.set",
+            "schema.get",
+            "schema.delete",
+            "schedule_put",
+        ];
 
-            // Spawn a task per request for concurrency.
+        for op in endpoints {
+            let ep_sub = group.add_endpoint(EndpointConfig::new(op)).await?;
             let msg_client = client.clone();
             let js = js.clone();
             let cfg = config.clone();
             let state = shared_state.clone();
             let store = shared_store.clone();
+            let op_name = op.to_string();
+
             wasip3::spawn(async move {
-                handler::handle(&msg_client, &js, &cfg, &state, &store, msg).await;
+                while let Ok(req) = ep_sub.next().await {
+                    let msg_client = msg_client.clone();
+                    let js = js.clone();
+                    let cfg = cfg.clone();
+                    let state = state.clone();
+                    let store = store.clone();
+                    let op_str = op_name.clone();
+
+                    wasip3::spawn(async move {
+                        handler::handle_service_request(
+                            &msg_client,
+                            &js,
+                            &cfg,
+                            &state,
+                            &store,
+                            req,
+                            &op_str,
+                        )
+                        .await;
+                    });
+                }
             });
+        }
+
+        eprintln!(
+            "lattice-db: ADR-32 microservice '{}' running (endpoints: {}, queue group: {queue_group})",
+            service.name(),
+            endpoints.len()
+        );
+
+        // Keep the main service loop alive.
+        loop {
+            wasip3::clocks::monotonic_clock::wait_for(nats_wasi::client::secs(3600)).await;
         }
     } else {
         // TCP-only mode: keep the process alive.

@@ -840,6 +840,22 @@ rm -f /tmp/ldb_watch_events.txt
 
 echo ""
 
+# ── ADR-32 MICROSERVICE DISCOVERY ────────────────────────────
+
+echo "--- ADR-32 MICROSERVICE DISCOVERY ---"
+
+SRV_PING=$($NATS req '$SRV.PING.ldb' '' --raw 2>/dev/null || echo "")
+assert_contains "ADR-32 PING returns service name" '"name":"ldb"' "$SRV_PING"
+
+SRV_INFO=$($NATS req '$SRV.INFO.ldb' '' --raw 2>/dev/null || echo "")
+assert_contains "ADR-32 INFO returns service endpoints" '"endpoints"' "$SRV_INFO"
+assert_contains "ADR-32 INFO contains ldb.get endpoint" '"name":"get"' "$SRV_INFO"
+
+SRV_STATS=$($NATS req '$SRV.STATS.ldb' '' --raw 2>/dev/null || echo "")
+assert_contains "ADR-32 STATS returns endpoint stats" '"endpoints"' "$SRV_STATS"
+
+echo ""
+
 # ── Summary ──────────────────────────────────────────────────
 
 echo "==================================="

@@ -468,7 +468,83 @@ struct ChangeEvent {
 
 // ── Dispatch ───────────────────────────────────────────────────────
 
-/// Handle an incoming request message. Replies via NATS to the reply-to subject.
+/// Unified operation dispatcher.
+pub async fn dispatch_operation(
+    client: &Client,
+    js: &JetStream,
+    config: &SharedConfig,
+    state: &SharedState,
+    store: &SharedStore,
+    op: &str,
+    payload: &[u8],
+) -> Result<Vec<u8>, (u16, String)> {
+    // Auth check.
+    if let Some(ref token) = config.auth_token {
+        if let Err(e) = check_auth(payload, token) {
+            return Err((401, e));
+        }
+    }
+
+    // S-01: reject reserved (_-prefixed) table names.
+    if let Err(e) = check_no_reserved_tables(op, payload) {
+        return Err((400, e));
+    }
+
+    let instance = config.instance.as_str();
+    let result = match op {
+        "get" => handle_get(state, store, payload).await,
+        "put" => handle_put(client, state, store, payload, instance).await,
+        "delete" => handle_delete(client, state, store, payload, instance).await,
+        "cas" => handle_cas(client, state, store, payload, instance).await,
+        "cas_delete" => handle_cas_delete(client, state, store, payload, instance).await,
+        "purge" => handle_purge(client, state, store, payload, instance).await,
+        "get_revision" => handle_get_revision(state, store, payload).await,
+        "create" => handle_create(client, state, store, payload, instance).await,
+        "exists" => handle_exists(state, store, payload).await,
+        "keys" => handle_keys(state, store, payload).await,
+        "scan" => handle_scan(state, store, payload).await,
+        "count" => handle_count(state, store, payload).await,
+        "index.create" | "index_create" => handle_index_create(state, store, payload).await,
+        "index.drop" | "index_drop" => handle_index_drop(state, store, payload).await,
+        "index.list" | "index_list" => handle_index_list(state, payload),
+        "txn" => handle_txn(js, state, store, payload, config.data_instance.as_str()).await,
+        "batch.get" | "batch_get" => handle_batch_get(state, store, payload).await,
+        "batch.put" | "batch_put" => handle_batch_put(client, state, store, payload, instance).await,
+        "aggregate" => handle_aggregate(state, store, payload).await,
+        "schema.set" | "schema_set" => handle_schema_set(state, store, payload).await,
+        "schema.get" | "schema_get" => handle_schema_get(state, payload),
+        "schema.delete" | "schema_delete" => handle_schema_delete(state, store, payload).await,
+        "schedule_put" => {
+            handle_schedule_put(js, state, store, payload, config.data_instance.as_str()).await
+        }
+        _ => Err(format!("unknown operation: {op}")),
+    };
+
+    result.map_err(|e| (400, e))
+}
+
+/// Handle a NATS ADR-32 Microservice endpoint request.
+pub async fn handle_service_request(
+    client: &Client,
+    js: &JetStream,
+    config: &SharedConfig,
+    state: &SharedState,
+    store: &SharedStore,
+    req: nats_wasi::service::ServiceRequest,
+    op: &str,
+) {
+    let result = dispatch_operation(client, js, config, state, store, op, req.payload()).await;
+    match result {
+        Ok(json_bytes) => {
+            let _ = req.respond(&json_bytes);
+        }
+        Err((code, err_msg)) => {
+            let _ = req.respond_error(code, &err_msg);
+        }
+    }
+}
+
+/// Handle an incoming raw request message (fallback/legacy).
 pub async fn handle(
     client: &Client,
     js: &JetStream,
@@ -478,62 +554,16 @@ pub async fn handle(
     msg: Message,
 ) {
     let Some(reply_to) = msg.reply_to.as_deref() else {
-        return; // no reply subject, nothing to respond to
+        return;
     };
 
-    // Auth check.
-    if let Some(ref token) = config.auth_token {
-        if let Err(e) = check_auth(&msg.payload, token) {
-            let resp = serde_json::to_vec(&ErrorResp { error: e }).unwrap_or_default();
-            let _ = client.publish(reply_to, &resp);
-            return;
-        }
-    }
-
-    // S-01: reject reserved (_-prefixed) table names before any prefix transformation.
     let prefix = format!("{instance}.", instance = config.instance);
     let op = msg.subject.strip_prefix(&prefix).unwrap_or(&msg.subject);
-    if let Err(e) = check_no_reserved_tables(op, &msg.payload) {
-        let resp = serde_json::to_vec(&ErrorResp { error: e }).unwrap_or_default();
-        let _ = client.publish(reply_to, &resp);
-        return;
-    }
-
-    let payload = msg.payload;
-
-    let instance = config.instance.as_str();
-    let result = match op {
-        "get" => handle_get(state, store, &payload).await,
-        "put" => handle_put(client, state, store, &payload, instance).await,
-        "delete" => handle_delete(client, state, store, &payload, instance).await,
-        "cas" => handle_cas(client, state, store, &payload, instance).await,
-        "cas_delete" => handle_cas_delete(client, state, store, &payload, instance).await,
-        "purge" => handle_purge(client, state, store, &payload, instance).await,
-        "get_revision" => handle_get_revision(state, store, &payload).await,
-        "create" => handle_create(client, state, store, &payload, instance).await,
-        "exists" => handle_exists(state, store, &payload).await,
-        "keys" => handle_keys(state, store, &payload).await,
-        "scan" => handle_scan(state, store, &payload).await,
-        "count" => handle_count(state, store, &payload).await,
-        "index.create" => handle_index_create(state, store, &payload).await,
-        "index.drop" => handle_index_drop(state, store, &payload).await,
-        "index.list" => handle_index_list(state, &payload),
-        "txn" => handle_txn(js, state, store, &payload, config.data_instance.as_str()).await,
-        "batch.get" => handle_batch_get(state, store, &payload).await,
-        "batch.put" => handle_batch_put(client, state, store, &payload, instance).await,
-        "aggregate" => handle_aggregate(state, store, &payload).await,
-        "schema.set" => handle_schema_set(state, store, &payload).await,
-        "schema.get" => handle_schema_get(state, &payload),
-        "schema.delete" => handle_schema_delete(state, store, &payload).await,
-        "schedule_put" => {
-            handle_schedule_put(js, state, store, &payload, config.data_instance.as_str()).await
-        }
-        _ => Err(format!("unknown operation: {op}")),
-    };
+    let result = dispatch_operation(client, js, config, state, store, op, &msg.payload).await;
 
     let resp_bytes = match result {
         Ok(json) => json,
-        Err(e) => serde_json::to_vec(&ErrorResp { error: e }).unwrap_or_default(),
+        Err((_code, e)) => serde_json::to_vec(&ErrorResp { error: e }).unwrap_or_default(),
     };
 
     let _ = client.publish(reply_to, &resp_bytes);

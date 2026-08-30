@@ -115,24 +115,23 @@ async fn handle_connection(
             return;
         }
     }
-    let payload: Vec<u8> = buf.drain(..len).collect();
-    eprintln!("lattice-db: tcp payload: {}", String::from_utf8_lossy(&payload));
+    let frame: Vec<u8> = buf.drain(..len).collect();
 
     // Dispatch the request.
-    let resp_bytes = dispatch(&client, &js, &config, &state, &store, &payload).await;
-    eprintln!("lattice-db: tcp response: {}", String::from_utf8_lossy(&resp_bytes));
+    let (status_code, resp_bytes) = dispatch(&client, &js, &config, &state, &store, &frame).await;
 
-    // Write length-prefixed response.
-    let resp_len = (resp_bytes.len() as u32).to_be_bytes();
-    let mut frame = Vec::with_capacity(4 + resp_bytes.len());
-    frame.extend_from_slice(&resp_len);
-    frame.extend_from_slice(&resp_bytes);
+    // Write framed response: [4 bytes BE total_len (2 + body_len)] [2 bytes BE status_code] [body]
+    let total_len = (2 + resp_bytes.len()) as u32;
+    let mut out_frame = Vec::with_capacity(4 + 2 + resp_bytes.len());
+    out_frame.extend_from_slice(&total_len.to_be_bytes());
+    out_frame.extend_from_slice(&status_code.to_be_bytes());
+    out_frame.extend_from_slice(&resp_bytes);
 
     let (mut tx, tx_rx) = wit_stream::new::<u8>();
     let _send_fut = conn.send(tx_rx);
     std::mem::forget(_send_fut);
 
-    tx.write_all(frame).await;
+    tx.write_all(out_frame).await;
     drop(tx);
     drop(rx);
     drop(_rx_done);
@@ -142,76 +141,81 @@ async fn handle_connection(
     wasip3::clocks::monotonic_clock::wait_for(1_000_000).await;
 }
 
-/// Dispatch a request. The payload is JSON with an `_op` field.
+/// Dispatch a framed request. Supports both:
+/// 1. Unified frame: [1 byte op_len] [op ASCII bytes] [JSON payload]
+/// 2. JSON fallback: `{"_op": "...", ...}`
 pub(crate) async fn dispatch(
     client: &Client,
     js: &JetStream,
     config: &SharedConfig,
     state: &SharedState,
     store: &SharedStore,
-    payload: &[u8],
-) -> Vec<u8> {
-    // Parse the `_op` field from the JSON payload.
-    let val: serde_json::Value = match serde_json::from_slice(payload) {
-        Ok(v) => v,
-        Err(e) => {
-            return serde_json::to_vec(&serde_json::json!({"error": format!("parse: {e}")}))
-                .unwrap_or_default();
-        }
-    };
-
-    let op = match val.get("_op").and_then(|v| v.as_str()) {
-        Some(op) => op.to_string(),
-        None => {
-            return serde_json::to_vec(&serde_json::json!({"error": "missing _op field"}))
-                .unwrap_or_default();
-        }
-    };
-
-    // Auth check (same as NATS path).
-    if let Some(ref token) = config.auth_token {
-        if let Err(e) = handler::check_auth(payload, token) {
-            return serde_json::to_vec(&serde_json::json!({"error": e})).unwrap_or_default();
-        }
+    frame: &[u8],
+) -> (u16, Vec<u8>) {
+    if frame.is_empty() {
+        return (
+            400,
+            serde_json::to_vec(&serde_json::json!({"error": "empty request frame"}))
+                .unwrap_or_default(),
+        );
     }
 
-    // Check reserved table names.
-    if let Err(e) = handler::check_no_reserved_tables(&op, payload) {
-        return serde_json::to_vec(&serde_json::json!({"error": e})).unwrap_or_default();
-    }
-
-    let instance = config.instance.as_str();
-    let result = match op.as_str() {
-        "get" => handler::handle_get(state, store, payload).await,
-        "put" => handler::handle_put(client, state, store, payload, instance).await,
-        "delete" => handler::handle_delete(client, state, store, payload, instance).await,
-        "cas" => handler::handle_cas(client, state, store, payload, instance).await,
-        "cas_delete" => handler::handle_cas_delete(client, state, store, payload, instance).await,
-        "purge" => handler::handle_purge(client, state, store, payload, instance).await,
-        "get_revision" => handler::handle_get_revision(state, store, payload).await,
-        "create" => handler::handle_create(client, state, store, payload, instance).await,
-        "exists" => handler::handle_exists(state, store, payload).await,
-        "keys" => handler::handle_keys(state, store, payload).await,
-        "scan" => handler::handle_scan(state, store, payload).await,
-        "count" => handler::handle_count(state, store, payload).await,
-        "index.create" => handler::handle_index_create(state, store, payload).await,
-        "index.drop" => handler::handle_index_drop(state, store, payload).await,
-        "index.list" => handler::handle_index_list(state, payload),
-        "txn" => {
-            handler::handle_txn(js, state, store, payload, config.data_instance.as_str()).await
+    let (op, payload) = if frame[0] < 32 {
+        // Framed command: [1-byte op_len][op][payload]
+        let op_len = frame[0] as usize;
+        if frame.len() < 1 + op_len {
+            return (
+                400,
+                serde_json::to_vec(&serde_json::json!({"error": "truncated op header"}))
+                    .unwrap_or_default(),
+            );
         }
-        "batch.get" => handler::handle_batch_get(state, store, payload).await,
-        "batch.put" => handler::handle_batch_put(client, state, store, payload, instance).await,
-        "aggregate" => handler::handle_aggregate(state, store, payload).await,
-        "schema.set" => handler::handle_schema_set(state, store, payload).await,
-        "schema.get" => handler::handle_schema_get(state, payload),
-        "schema.delete" => handler::handle_schema_delete(state, store, payload).await,
-        _ => Err(format!("unknown operation: {op}")),
+        let op = match std::str::from_utf8(&frame[1..1 + op_len]) {
+            Ok(s) => s,
+            Err(_) => {
+                return (
+                    400,
+                    serde_json::to_vec(&serde_json::json!({"error": "invalid op encoding"}))
+                        .unwrap_or_default(),
+                );
+            }
+        };
+        (op.to_string(), &frame[1 + op_len..])
+    } else {
+        // Fallback: parse `_op` field from the JSON payload.
+        let val: serde_json::Value = match serde_json::from_slice(frame) {
+            Ok(v) => v,
+            Err(e) => {
+                return (
+                    400,
+                    serde_json::to_vec(&serde_json::json!({"error": format!("parse: {e}")}))
+                        .unwrap_or_default(),
+                );
+            }
+        };
+
+        let op = match val.get("_op").and_then(|v| v.as_str()) {
+            Some(op) => op.to_string(),
+            None => {
+                return (
+                    400,
+                    serde_json::to_vec(&serde_json::json!({"error": "missing _op field"}))
+                        .unwrap_or_default(),
+                );
+            }
+        };
+        (op, frame)
     };
+
+    let result =
+        handler::dispatch_operation(client, js, config, state, store, &op, payload).await;
 
     match result {
-        Ok(json) => json,
-        Err(e) => serde_json::to_vec(&serde_json::json!({"error": e})).unwrap_or_default(),
+        Ok(json) => (0, json),
+        Err((code, err_msg)) => (
+            code,
+            serde_json::to_vec(&serde_json::json!({"error": err_msg})).unwrap_or_default(),
+        ),
     }
 }
 

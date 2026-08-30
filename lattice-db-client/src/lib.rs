@@ -860,10 +860,18 @@ impl LatticeDb {
         }
         let body = serde_json::to_vec(&value).map_err(|e| Error::Json(e.to_string()))?;
         let reply = self.client.request(subject, &body, self.timeout).await?;
+
+        // Check for ADR-32 service error headers first.
+        if let Some(headers) = &reply.headers {
+            if let Some(err_msg) = headers.get(nats_wasi::service::HEADER_ERROR_DESCRIPTION) {
+                return Err(Error::Db(err_msg.to_string()));
+            }
+        }
+
         let reply_value: serde_json::Value =
             serde_json::from_slice(&reply.payload).map_err(|e| Error::Json(e.to_string()))?;
 
-        // Check for error response first.
+        // Check for error response in JSON body fallback.
         if let Ok(err) = serde_json::from_value::<ErrorR>(reply_value.clone()) {
             if let Some(msg) = err.error {
                 return Err(Error::Db(msg));

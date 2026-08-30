@@ -1,5 +1,29 @@
 # Changelog
 
+## [1.11.0] - 2026-08-31
+
+### Added
+
+- **NATS Microservices Framework (ADR-32) Implementation**:
+  - Migrated `storage-service` to the official NATS Microservices Framework (ADR-32) using `nats-wasip3` v0.12.0.
+  - Automatic service registration under `ServiceConfig::new(instance, version)` with queue group `{instance}-workers` and instance metadata.
+  - Registers all 23 database endpoints (`get`, `put`, `delete`, `cas`, `cas_delete`, `purge`, `get_revision`, `create`, `exists`, `keys`, `scan`, `count`, `index.create`, `index.drop`, `index.list`, `txn`, `batch.get`, `batch.put`, `aggregate`, `schema.set`, `schema.get`, `schema.delete`, `schedule_put`) under service group `{instance}`.
+  - Standard discovery, ping, info, stats, and schema endpoints (`$SRV.PING`, `$SRV.INFO`, `$SRV.STATS`, `$SRV.SCHEMA`) active and discoverable via standard NATS tooling (`nats service ls`, `nats service stats`).
+  - Standardized error handling via `req.respond_error` setting `Nats-Service-Error-Code` and `Nats-Service-Error` headers.
+
+- **Modernized & Framed TCP Protocol**:
+  - Replaced legacy JSON `_op` mutation with explicit binary framing matching NATS ADR-32 command dispatch.
+  - Request frame: `[4-byte total_len BE][1-byte op_len][op ASCII][payload JSON bytes]`.
+  - Response frame: `[4-byte total_len BE][2-byte status_code BE][response JSON bytes]`.
+  - Unified server-side operation dispatch via `handler::dispatch_operation` shared between TCP and NATS.
+
+### Changed
+
+- **`lattice-db-client`**:
+  - Updated `req()` to check ADR-32 `Nats-Service-Error-Code` and `Nats-Service-Error` headers in addition to JSON body fallbacks.
+- **Dependencies**:
+  - Updated `nats-wasip3` dependency to `0.12.0`.
+
 ## [1.10.1] - 2026-08-24
 
 ### Changed
